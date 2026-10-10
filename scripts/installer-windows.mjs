@@ -421,6 +421,33 @@ export function ensureWindowsPnpmHome(home, env, { processAdapter = windowsProce
 	return output;
 }
 
+// The same claim for another private folder (the bundled install's prefix): only
+// the folder, its marker file and the marker text differ, and they travel as
+// environment data like every other path.
+const privateFolderClaim = [["$env:GENTLE_WINDOWS_PNPM_HOME", "$env:GENTLE_WINDOWS_PRIVATE_FOLDER"],
+	["'.gentle-shell-pnpm-home'", "$env:GENTLE_WINDOWS_PRIVATE_MARKER"], ["'gentle-pi private pnpm home'", "$env:GENTLE_WINDOWS_PRIVATE_TEXT"]]
+	.reduce((script, [from, to]) => {
+		if (!script.includes(from)) throw new Error("Windows private folder claim template changed");
+		return script.replaceAll(from, to);
+	}, pnpmHomeClaim);
+/** ensureWindowsPnpmHome for another private folder, marked with `marker`
+ * (a `.name` file) holding `text`. Returns "claimed" or "kept"; anything else,
+ * including a non-empty unmarked folder, throws.
+ */
+export function ensureWindowsPrivateFolder(folder, env, { marker, text, processAdapter = windowsProcessCheck, storage = verifyWindowsStorage, platform = process.platform }) {
+	if (platform !== "win32") throw new Error("Native Windows storage verification unavailable");
+	if (!win32.isAbsolute(folder) || folder.startsWith("\\\\")) throw new Error("Unsafe Windows storage path");
+	if (!/^\.[a-z][a-z-]*$/.test(marker) || !/^[a-z][a-z -]*$/.test(text)) throw new Error("Unsafe Windows private folder marker");
+	const output = windowsPowerShell(env, privateFolderClaim, { GENTLE_WINDOWS_PRIVATE_FOLDER: folder, GENTLE_WINDOWS_PRIVATE_MARKER: marker, GENTLE_WINDOWS_PRIVATE_TEXT: text }, processAdapter);
+	if (output !== "claimed" && output !== "kept") {
+		const check = /^unsafe:(policy|foreign|protected-dacl|private-owner|private-ace)$/.exec(output)?.[1];
+		throw Object.assign(new Error("Windows private folder claim rejected"), check ? { check } : {});
+	}
+	storage(folder, env);
+	storage(win32.join(folder, privatePnpmHome.temp), env);
+	return output;
+}
+
 /** Strict bounded tar reader: no system tar, archive links or archive execution.
  * Unsupported GNU/PAX extensions stop rather than extract using guessed semantics.
  */
