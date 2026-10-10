@@ -457,14 +457,15 @@ export function createProbes({ platform, env, run, fs, home, verifyGentleAi = pa
 			const result = runnable ? await run(ownPnpm.command, [...ownPnpm.prefix, "--version"], { env: user, cwd: path.parse(own).root, deadlineMs: deadlines.version }) : null;
 			const found = succeeded(result) && result.truncated !== true ? exactVersion(result.stdout, STABLE) : null;
 			const usableFound = found !== null && Number(found.split(".")[0]) === PNPM_MAJOR && atLeast(found, requirements.pnpm);
-			// Persisting pnpm writes $PNPM_HOME/bin: a user's pnpm there is reported as it is
-			// (incompatible, or unknown without a version), never replaced or downgraded.
-			// One that fails the walk never runs: the bootstrap's pnpm is reported in its
-			// place, as persistent, so nothing is persisted over the user's.
+			// Persisting pnpm writes $PNPM_HOME/bin: a user's pnpm there with a stable version
+			// is reported as it is (an incompatible one blocks), never replaced or downgraded.
+			// One that fails the walk (untrusted), or whose shim is not recognized or whose
+			// version cannot be read (unchecked), is never run again: the bootstrap's pnpm is
+			// reported in its place, as persistent, so nothing is persisted over the user's.
 			if (own && globalBin && samePath(path.dirname(own), globalBin.path, platform)) {
-				if (ownPnpm !== null && !runnable) return { available: true, version, usable: true, compatible, persistent: true, inGlobalBin: true, untrusted: true };
-				return found ? { available: true, version: found, usable: true, compatible: usableFound, persistent: true, inGlobalBin: true }
-					: { ...unknown(), inGlobalBin: true };
+				if (found) return { available: true, version: found, usable: true, compatible: usableFound, persistent: true, inGlobalBin: true };
+				return { available: true, version, usable: true, compatible, persistent: true, inGlobalBin: true,
+					...(ownPnpm !== null && !runnable ? { untrusted: true } : { unchecked: true }) };
 			}
 			const replaced = found !== null && !usableFound;
 			return { available: true, version, usable: true, compatible, persistent: false, ...(replaced ? { found } : {}) };

@@ -411,6 +411,10 @@ function planView(planId, { inventory, plan }) {
 	else if (ids.includes("persist-package-managers")) tools = ["npm", "pnpm"];
 	else if (ids.includes("persist-npm")) tools = ["npm"];
 	else if (ids.includes("persist-pnpm")) tools = ["pnpm"];
+	// A user's pnpm in $PNPM_HOME/bin that could not be checked: kept, never run again.
+	const unchecked = plan.tools?.pnpm?.unchecked === true
+		? "The pnpm in the pnpm global bin directory could not be checked, so it was left as it is, and the installer uses its own verified pnpm for this installation."
+		: null;
 	return {
 		planId,
 		ready: plan.ready === true,
@@ -436,7 +440,8 @@ function planView(planId, { inventory, plan }) {
 			tools,
 			pnpmHome,
 			description: tools.length > 0
-				? [`${tools.join(", ")} will be installed under $PNPM_HOME (${pnpmHome ?? "pnpm's home directory"}) so new terminals keep working after the temporary installer tools are removed. Existing installations are not replaced.`, ...alongside].join(" ")
+				? [`${tools.join(", ")} will be installed under $PNPM_HOME (${pnpmHome ?? "pnpm's home directory"}) so new terminals keep working after the temporary installer tools are removed. Existing installations are not replaced.`, ...alongside, ...(unchecked ? [unchecked] : [])].join(" ")
+				: unchecked ? `No runtime needs to be installed under $PNPM_HOME. ${unchecked}`
 				: "No runtime needs to be installed under $PNPM_HOME; your existing Node.js, npm and pnpm are reused.",
 		},
 	};
