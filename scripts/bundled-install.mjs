@@ -465,7 +465,11 @@ export async function installVersion({ layout, manifest, lockfile, platform = la
 		for (const [name, text] of Object.entries({ ...files, "pnpm-lock.yaml": lockfile })) writeFileSync(path.join(destination, name), text, { flag: "wx", mode: 0o600 });
 		const result = await (adapters.run ?? runCommand)(layout.node, [layout.pnpm, "install", "--frozen-lockfile"],
 			{ cwd: destination, env: pnpmEnvironment(layout, { platform, env, go }), timeout: INSTALL_TIMEOUT });
-		if (result.status !== 0) throw Object.assign(new Error("pnpm install failed"), { stderr: String(result.stderr ?? "").slice(-4000) });
+		// pnpm prints install and postinstall failures on stdout: keep both tails.
+		if (result.status !== 0) {
+			throw Object.assign(new Error(`pnpm install failed (exit ${result.status})`),
+				{ stderr: [String(result.stdout ?? "").slice(-6000), String(result.stderr ?? "").slice(-4000)].filter(Boolean).join("\n") });
+		}
 		const shellDirectory = installedPackage(destination, "gentle-pi", shell, "gentle-pi");
 		installedPackage(destination, "@earendil-works/pi-coding-agent", pi, "Pi");
 		if (!regular(path.join(shellDirectory, "bin", "gentle-shell.mjs"))) throw new Error("Installed gentle-pi has no launcher entry");

@@ -380,6 +380,11 @@ posixTest("installVersion rejects a wrong installed version, a foreign folder an
 	assert.deepEqual(readdirSync(layout.versions), []);
 	await assert.rejects(installVersion({ layout, manifest, lockfile: "x", platform: "darwin", env: {}, adapters: { run: () => ({ status: 1, stdout: "", stderr: "ERR_PNPM" }) } }), /pnpm install failed/);
 	assert.deepEqual(readdirSync(layout.versions), []);
+	// pnpm prints install and postinstall failures on stdout: the error keeps both streams.
+	await assert.rejects(installVersion({ layout, manifest, lockfile: "x", platform: "darwin", env: {},
+		adapters: { run: () => ({ status: 1, stdout: "postinstall: Gentle AI build failed\n[ELIFECYCLE] exit 1", stderr: "" }) } }),
+		(error: Error & { stderr?: string }) => /pnpm install failed \(exit 1\)/.test(error.message) && /Gentle AI build failed/.test(String(error.stderr)));
+	assert.deepEqual(readdirSync(layout.versions), []);
 	mkdirSync(join(layout.versions, "4.1.0-1.0.2"));
 	writeFileSync(join(layout.versions, "4.1.0-1.0.2", "user.txt"), "keep");
 	await assert.rejects(installVersion({ layout, manifest, lockfile: "x", platform: "darwin", env: {}, adapters: { run: fakePnpm().run } }), /Conflicting version/);
