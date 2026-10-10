@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, readdirSync, rmSync, copyFileSync, existsSync, symlinkSync, realpathSync } from "node:fs";
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, readdirSync, rmSync, copyFileSync, existsSync, symlinkSync, realpathSync, lstatSync } from "node:fs";
 import { dirname, join, parse } from "node:path";
 import { tmpdir } from "node:os";
 import { gzipSync } from "node:zlib";
@@ -13,6 +13,7 @@ import { lookPath, upgradeInvocation, windowsInvocation } from "../scripts/insta
 import { validateWindowsEntries, windowsShim, windowsNodeFloor, readWindowsPnpmArchive, ensureWindowsPnpm, windowsProcessCheck, windowsAclRuleUnsafe, verifyWindowsStorage,
 	bootstrapWindows, windowsBootstrapReason, windowsStorageEvidence } from "../scripts/installer-windows.mjs";
 import * as windowsModule from "../scripts/installer-windows.mjs";
+import * as bundled from "../scripts/bundled-install.mjs";
 
 // Real Windows shims, verbatim (CRLF) as their generators write them. npm cmd-shim:
 // github.com/npm/cmd-shim tap-snapshots/test/basic.js.test.cjs, v4.1.0-v8.0.0 ("env
@@ -2141,5 +2142,168 @@ test("native Windows: the Gentle AI source build succeeds from a package root de
 		assert.equal(result.binaryPath, join(packageRoot, ".gentle-ai", `v${installer.INSTALLER_VERSION}`, "gentle-ai.exe"));
 		assert.ok(existsSync(result.binaryPath));
 		assert.deepEqual(readdirSync(temporaryDirectory), [], "the short build directory is removed");
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// Bundled install (S2, S3, S6) on a real Windows host. The pinned Node and pnpm
+// are downloaded once per run (verifiedDownload still checks every byte against
+// the pins); local fixture packages stand in for the registry.
+const bundledDownloads = new Map<string, Promise<Buffer>>();
+function bundledDownload(descriptor: { url: string }) {
+	if (!bundledDownloads.has(descriptor.url)) {
+		bundledDownloads.set(descriptor.url, fetch(descriptor.url, { redirect: "error", signal: AbortSignal.timeout(180000) }).then(async (response) => {
+			if (!response.ok) throw new Error(`Download failed: ${response.status}`);
+			return Buffer.from(await response.arrayBuffer());
+		}));
+	}
+	return bundledDownloads.get(descriptor.url)!;
+}
+const bundledManifest = { shell: "4.1.0", pi: "1.0.2" };
+/** A bundled prefix in a plain fixture folder standing in for %LOCALAPPDATA%: the
+ * claim itself is native-tested separately, so here it only creates the folder. */
+function bundledPrefix(root: string) {
+	const local = join(root, "local"); const roaming = join(root, "roaming"); const profile = join(root, "profile");
+	for (const folder of [local, roaming, profile]) mkdirSync(folder);
+	const env = { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(?:pnpm_home|localappdata|appdata|userprofile|home)$/i.test(key))),
+		LOCALAPPDATA: local, APPDATA: roaming, USERPROFILE: profile, HOME: profile } as Record<string, string>;
+	const layout = bundled.claimPrefix({ platform: "win32", env, home: profile, adapters: { storage: () => {}, claim: (folder: string) => { mkdirSync(folder); return "claimed"; } } });
+	// installVersion requires the pinned Go on Windows; the fixture packages never run it.
+	const go = join(layout.goRoot, "1.25.14", "go", "bin", "go.exe");
+	mkdirSync(dirname(go), { recursive: true });
+	writeFileSync(go, "");
+	return { local, profile, env, layout, go };
+}
+function bundledLinks(folder: string): string[] {
+	return readdirSync(folder).flatMap((name) => {
+		const path = join(folder, name);
+		const info = lstatSync(path);
+		return info.isSymbolicLink() ? [path] : info.isDirectory() ? bundledLinks(path) : [];
+	});
+}
+const insideFolder = (folder: string, path: string) => path.toLowerCase().startsWith(`${folder.toLowerCase()}\\`);
+
+test("native Windows: a bundled version installs in place with the real pinned pnpm, every link resolves inside versions\\<id>, and the launcher runs it", { skip: nativeUnavailable }, async () => {
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "gentle bundled ")));
+	try {
+		const { env, layout, go } = bundledPrefix(root);
+		await bundled.ensureRuntime({ layout, platform: "win32", arch: process.arch, env, adapters: { download: bundledDownload } });
+		const packages = join(layout.root, "packages"); mkdirSync(packages);
+		writeFileSync(join(packages, "gentle-pi.tgz"), tarFixture({
+			"package/package.json": JSON.stringify({ name: "gentle-pi", version: bundledManifest.shell, type: "module", scripts: { postinstall: "node postinstall.mjs" } }),
+			"package/postinstall.mjs": "import { writeFileSync } from \"node:fs\";\nwriteFileSync(\"postinstall.txt\", process.execPath);\n",
+			"package/bin/gentle-shell.mjs": "console.log(JSON.stringify({ execPath: process.execPath, args: process.argv.slice(2) }));\nprocess.exitCode = Number(process.argv[2]);\n",
+		}));
+		writeFileSync(join(packages, "pi.tgz"), tarFixture({ "package/package.json": JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: bundledManifest.pi }) }));
+		// Both project folders sit two levels under the prefix, so the lockfile's relative file: paths match.
+		const files = { "package.json": JSON.stringify({ name: "gentle-shell-distribution", version: bundledManifest.shell, private: true,
+			dependencies: { "gentle-pi": "file:../../packages/gentle-pi.tgz", "@earendil-works/pi-coding-agent": "file:../../packages/pi.tgz" } }),
+			"pnpm-workspace.yaml": bundled.distributionFiles(bundledManifest)["pnpm-workspace.yaml"] };
+		const resolve = join(layout.root, "lockfile", "4.1.0-1.0.2"); mkdirSync(resolve, { recursive: true });
+		for (const [name, text] of Object.entries(files)) writeFileSync(join(resolve, name), text);
+		const childEnv = bundled.pnpmEnvironment(layout, { platform: "win32", env, go });
+		const lock = spawnSync(layout.node, [layout.pnpm, "install", "--lockfile-only"], { cwd: resolve, env: childEnv, encoding: "utf8", timeout: 300000, windowsHide: true });
+		assert.equal(lock.status, 0, lock.stderr + lock.stdout);
+		const result = await bundled.installVersion({ layout, manifest: bundledManifest, lockfile: readFileSync(join(resolve, "pnpm-lock.yaml"), "utf8"), env, go,
+			adapters: { distribution: () => files } });
+		assert.deepEqual(result, { id: "4.1.0-1.0.2", path: join(layout.versions, "4.1.0-1.0.2"), installed: true });
+		const version = realpathSync.native(result.path);
+		const links = bundledLinks(join(result.path, "node_modules"));
+		assert.ok(links.length > 0, "pnpm linked the packages");
+		for (const link of links) assert.ok(insideFolder(version, realpathSync.native(link)), `${link} resolves inside the version folder`);
+		// The build script ran with our Node, first on PATH (long names compared: the temp folder may be 8.3).
+		const ourNode = realpathSync.native(layout.node).toLowerCase();
+		assert.equal(realpathSync.native(readFileSync(join(result.path, "node_modules", "gentle-pi", "postinstall.txt"), "utf8")).toLowerCase(), ourNode);
+		bundled.activateVersion(layout, result.id);
+		bundled.ensureLauncher(layout);
+		const cmd = join(process.env.SystemRoot!, "System32", "cmd.exe");
+		const run = spawnSync(cmd, ["/d", "/s", "/c", `""${layout.launcher}" 0 "a b""`], { env, encoding: "utf8", timeout: 60000, windowsHide: true, windowsVerbatimArguments: true });
+		assert.equal(run.status, 0, run.stderr);
+		const output = JSON.parse(run.stdout);
+		assert.deepEqual([realpathSync.native(output.execPath).toLowerCase(), output.args], [ourNode, ["0", "a b"]]);
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("native Windows: the bundled .cmd launcher runs from a path holding spaces and & % ^ ( ! , passes the exit code, and names a missing version", { skip: nativeUnavailable }, async () => {
+	const f = nativeFixture();
+	try {
+		const profile = join(f.root, "profile"); mkdirSync(profile);
+		const layout = bundled.prefixLayout({ platform: "win32", env: {}, home: profile, root: join(f.root, "a^b,c (d) !e %f%", "gentle-shell") });
+		for (const folder of [layout.versions, layout.bin, dirname(layout.node)]) mkdirSync(folder, { recursive: true });
+		copyFileSync(process.execPath, layout.node);
+		const go = join(layout.goRoot, "1.25.14", "go", "bin", "go.exe");
+		mkdirSync(dirname(go), { recursive: true }); writeFileSync(go, "");
+		const run = (_command: string, _args: string[], { cwd }: { cwd: string }) => {
+			const shell = join(cwd, "node_modules", "gentle-pi"); const pi = join(cwd, "node_modules", "@earendil-works", "pi-coding-agent");
+			mkdirSync(join(shell, "bin"), { recursive: true }); mkdirSync(pi, { recursive: true });
+			writeFileSync(join(shell, "package.json"), JSON.stringify({ name: "gentle-pi", version: bundledManifest.shell }));
+			writeFileSync(join(shell, "bin", "gentle-shell.mjs"), "console.log(JSON.stringify(process.argv.slice(2)));\nprocess.exitCode = Number(process.argv[2]);\n");
+			writeFileSync(join(pi, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: bundledManifest.pi }));
+			return { status: 0, stdout: "", stderr: "" };
+		};
+		const { id } = await bundled.installVersion({ layout, manifest: bundledManifest, lockfile: "x", env: {}, go, adapters: { run } });
+		bundled.ensureLauncher(layout);
+		// Run by name through PATH, as a terminal does.
+		const env = nativePath([layout.bin, join(process.env.SystemRoot!, "System32")]);
+		const cmd = join(process.env.SystemRoot!, "System32", "cmd.exe");
+		const launch = () => spawnSync(cmd, ["/d", "/c", "gentle-shell 7 \"x & y\" 100%"], { env, encoding: "utf8", timeout: 60000, windowsHide: true, windowsVerbatimArguments: true });
+		const missing = "gentle-shell: no active Gentle Shell version; run the Gentle Shell installer again.";
+		const none = launch();
+		assert.deepEqual([none.status, none.stderr.trim(), none.stdout], [1, missing, ""]);
+		bundled.activateVersion(layout, id);
+		const ran = launch();
+		assert.deepEqual([ran.status, JSON.parse(ran.stdout)], [7, ["7", "x & y", "100%"]], ran.stderr);
+		writeFileSync(layout.current, "9.9.9-9.9.9\n");
+		const gone = launch();
+		assert.deepEqual([gone.status, gone.stderr.trim()], [1, missing]);
+	} finally { f.cleanup(); }
+});
+
+test("native Windows: the bundled prefix claim creates, adopts an empty folder, keeps a marked one, and never adopts a foreign folder or a reparse point", { skip: nativeUnavailable }, async (t) => {
+	const f = await ownedNativeFixture();
+	try {
+		const local = join(f.root, "local"); const profile = join(f.root, "profile"); mkdirSync(local); mkdirSync(profile);
+		const env = withoutPnpmHome(process.env, { LOCALAPPDATA: local, USERPROFILE: profile });
+		const layout = bundled.claimPrefix({ platform: "win32", env, home: profile });
+		assert.equal(layout.root, join(local, "gentle-shell"));
+		verifyWindowsStorage(layout.root, env);
+		assert.equal(readFileSync(join(layout.root, ".gentle-shell-bundle"), "utf8"), "gentle-shell bundled install");
+		for (const folder of [layout.runtime, layout.store, layout.versions, layout.bin, layout.tmp]) assert.equal(existsSync(folder), true, folder);
+		assert.equal(bundled.claimPrefix({ platform: "win32", env, home: profile }).root, layout.root, "a marked prefix is kept");
+		const claim = (folder: string) => windowsModule.ensureWindowsPrivateFolder(folder, env, { marker: ".gentle-shell-bundle", text: "gentle-shell bundled install" });
+		assert.equal(claim(layout.root), "kept");
+		const empty = join(f.root, "empty"); mkdirSync(empty);
+		assert.equal(claim(empty), "claimed");
+		const foreign = join(f.root, "foreign"); mkdirSync(foreign); writeFileSync(join(foreign, "notes.txt"), "keep");
+		assert.throws(() => claim(foreign), (error: { check?: string }) => error.check === "foreign");
+		assert.deepEqual(readdirSync(foreign), ["notes.txt"]);
+		const target = join(f.root, "junction-target"); mkdirSync(target);
+		const junction = join(f.root, "junction");
+		try { symlinkSync(target, junction, "junction"); }
+		catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (["EPERM", "EACCES", "ENOTSUP"].includes(code ?? "")) { t.skip(`owned junction creation capability unavailable: ${code}`); return; }
+			throw error;
+		}
+		assert.throws(() => claim(junction), (error: { check?: string }) => error.check === "foreign");
+		assert.deepEqual(readdirSync(target), [], "nothing is written through the junction");
+	} finally { f.cleanup(); }
+});
+
+test("native Windows: the bundled pnpm keeps its store, cache and state in the prefix and writes nothing under %LOCALAPPDATA%\\pnpm or the profile", { skip: nativeUnavailable }, async () => {
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "gentle bundled ")));
+	try {
+		const { local, profile, env, layout } = bundledPrefix(root);
+		await bundled.ensureRuntime({ layout, platform: "win32", arch: process.arch, env, adapters: { download: bundledDownload } });
+		const childEnv = bundled.pnpmEnvironment(layout, { platform: "win32", env });
+		const pnpm = (...args: string[]) => {
+			const result = spawnSync(layout.node, [layout.pnpm, ...args], { cwd: layout.versions, env: childEnv, encoding: "utf8", timeout: 120000, windowsHide: true });
+			assert.equal(result.status, 0, result.stderr);
+			return result.stdout.trim();
+		};
+		assert.equal(pnpm("--version"), "11.1.1");
+		for (const [key, folder] of [["store-dir", layout.store], ["cache-dir", layout.cache], ["state-dir", layout.state]]) assert.equal(pnpm("config", "get", key), folder, key);
+		assert.ok(insideFolder(layout.store, pnpm("store", "path")), "the resolved store is inside the prefix");
+		assert.deepEqual(readdirSync(local).filter((name) => /pnpm/i.test(name)), []);
+		assert.deepEqual(readdirSync(profile).filter((name) => /pnpm|npmrc/i.test(name)), []);
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
