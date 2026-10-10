@@ -147,7 +147,7 @@ jobs:
         run: node --experimental-strip-types --test --test-reporter=tap tests/install-wizard.test.ts tests/installer-server.test.ts tests/verify-package-files.test.ts tests/installer-probes.test.ts tests/installer-runner.test.ts tests/installer-preflight.test.ts tests/installer-posix-bootstrap.test.ts tests/installer-windows-bootstrap.test.ts
 
       # The native tests skip off Windows; here every one must run and pass: exactly
-      # the 35 native tests (27 literal tests plus 8 process primitive modes) that
+      # the 36 native tests (28 literal tests plus 8 process primitive modes) that
       # tests/installer-windows-bootstrap.test.ts defines, with 0 skips.
       - name: Require native Windows installer tests
         if: runner.os == 'Windows'
@@ -160,4 +160,4 @@ jobs:
           $text = $output -join "`n"
           $passes = [regex]::Match($text, "(?m)^# pass (\d+)$")
           $skips = [regex]::Match($text, "(?m)^# skipped (\d+)$")
-          if (!$passes.Success -or [int]$passes.Groups[1].Value -ne 35 -or !$skips.Success -or [int]$skips.Groups[1].Value -ne 0) { throw "Native Windows installer tests were skipped or not selected" }
+          if (!$passes.Success -or [int]$passes.Groups[1].Value -ne 36 -or !$skips.Success -or [int]$skips.Groups[1].Value -ne 0) { throw "Native Windows installer tests were skipped or not selected" }

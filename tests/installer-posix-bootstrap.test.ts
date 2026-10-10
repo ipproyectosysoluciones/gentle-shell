@@ -101,6 +101,54 @@ test("download helper fails closed on integrity, empty body and adapter failure"
 		await assert.rejects(verifiedDownload("pnpm", { download }), /Download|integrity/);
 	}
 });
+/** A local server that, like dl.google.com, gzips the body when the client accepts it. */
+async function compressingServer(bytes: Buffer, always = false) {
+	const { createServer } = await import("node:http");
+	const seen: string[] = [];
+	const server = createServer((request, response) => {
+		const accepted = String(request.headers["accept-encoding"] ?? "");
+		seen.push(accepted);
+		if (always || /gzip/.test(accepted)) {
+			const body = gzipSync(bytes);
+			response.writeHead(200, { "content-encoding": "gzip", "content-length": String(body.length) });
+			response.end(body);
+		} else {
+			response.writeHead(200, { "content-length": String(bytes.length) });
+			response.end(bytes);
+		}
+	});
+	await new Promise<void>((done) => server.listen(0, "127.0.0.1", () => done()));
+	const { port } = server.address() as { port: number };
+	return { url: `http://127.0.0.1:${port}/go.zip`, seen, close: () => new Promise((done) => server.close(done)) };
+}
+function localArtifact(url: string, bytes: Buffer) {
+	return () => ({ url, size: bytes.length, maxBytes: bytes.length, integrity: `sha256-${createHash("sha256").update(bytes).digest("hex")}` });
+}
+
+test("the real download asks for the identity encoding, so a server that would gzip the archive sends it whole", async () => {
+	const bytes = Buffer.concat([Buffer.from("PK\u0003\u0004"), Buffer.alloc(4096, 7)]);
+	const server = await compressingServer(bytes);
+	try {
+		const result = await verifiedDownload("go", { artifact: localArtifact(server.url, bytes) });
+		assert.deepEqual(result, bytes);
+		assert.deepEqual(server.seen, ["identity"]);
+	} finally { await server.close(); }
+});
+
+test("an encoded response is refused with its cause instead of being reported as truncated", async () => {
+	const bytes = Buffer.alloc(4096, 9);
+	const server = await compressingServer(bytes, true);
+	try {
+		await assert.rejects(verifiedDownload("go", { artifact: localArtifact(server.url, bytes) }),
+			(error: Error) => error.message === "Download failed" && /encoded/.test(String((error.cause as Error)?.message)));
+	} finally { await server.close(); }
+});
+
+test("a failed download keeps the transport error as its cause", async () => {
+	await assert.rejects(verifiedDownload("pnpm", { download: async () => { throw new Error("socket hang up"); } }),
+		(error: Error) => error.message === "Download failed" && (error.cause as Error)?.message === "socket hang up");
+});
+
 test("download helper validates bytes before returning them", async () => {
 	const bytes = Buffer.from("verified fixture");
 	let observed = "";
@@ -1122,6 +1170,6 @@ test("the CI native Windows gate requires exactly the native tests the Windows b
 	const gate = /\[int\]\$passes\.Groups\[1\]\.Value -ne (\d+) -or/.exec(ci);
 	assert.ok(gate, "the gate compares the passed count exactly");
 	assert.ok(/\[int\]\$skips\.Groups\[1\]\.Value -ne 0/.test(ci), "0 skips stays required");
-	assert.equal(literal + modes, 35);
+	assert.equal(literal + modes, 36);
 	assert.equal(Number(gate[1]), literal + modes);
 });
