@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, rmSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
-import test, { type TestContext } from "node:test";
+import test, { after, type TestContext } from "node:test";
 import { crc32, gzipSync } from "node:zlib";
 import { activateVersion, activeVersion, applyPathEntry, claimPrefix, distributionFiles, ensureLauncher, ensureRuntime, installVersion, nodeExecutable,
 	pathEntryPlan, pnpmEnvironment, prefixLayout, pruneVersions, removePathEntry } from "../scripts/bundled-install.mjs";
@@ -15,8 +15,17 @@ const posixTest = (name: string, fn: (t: TestContext) => void | Promise<void>) =
 const NODE = "24.21.0";
 const PNPM = "11.1.1";
 
+// Every temporary home this file creates is removed when the file's tests end.
+const roots: string[] = [];
+after(() => {
+	for (const root of roots) {
+		try { chmodSync(root, 0o700); } catch {}
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 function home() {
 	const root = mkdtempSync(join(realpathSync(tmpdir()), "bundled-install-"));
+	roots.push(root);
 	const dir = join(root, "home ü");
 	mkdirSync(dir, { mode: 0o700 });
 	return dir;

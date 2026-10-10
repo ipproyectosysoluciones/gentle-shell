@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { DISTRIBUTION_ASSETS, claimPrefix, distributionAsset, distributionFiles, installVersion, pnpmEnvironment, readDistribution } from "../scripts/bundled-install.mjs";
-import { buildDistribution, verifyDistribution } from "../scripts/build-distribution.mjs";
+import { buildDistribution, main, verifyDistribution } from "../scripts/build-distribution.mjs";
 import { artifactFor } from "../scripts/installer-downloads.mjs";
 import { PI_INSTALL_VERSION } from "../scripts/installer-preflight.mjs";
 
@@ -18,19 +18,27 @@ const manifest = { shell: "4.1.0", pi: "1.0.2" };
 const LOCKFILE = "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n";
 const sha256 = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
 
-function claimed() {
+/** A new folder in the system tmpdir, removed when the test ends. */
+function temporary(t: TestContext) {
 	const root = mkdtempSync(join(realpathSync(tmpdir()), "build-distribution-"));
-	const home = join(root, "home");
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	return root;
+}
+function claimed(t: TestContext) {
+	const home = join(temporary(t), "home");
 	mkdirSync(home, { mode: 0o700 });
 	return claimPrefix({ platform: "darwin", env: { HOME: home }, home });
 }
 type Run = { command: string; args: string[]; cwd: string; env: Record<string, string>; files: Record<string, string> };
 /** Our pnpm resolving the lockfile: it records what it saw, writes the lockfile,
  * and, like pnpm 11 after skipped builds, may rewrite pnpm-workspace.yaml. */
-function fakeResolver({ lockfile = LOCKFILE, rewrite = false, status = 0 } = {}) {
+function fakeResolver({ lockfile = LOCKFILE, rewrite = false, status = 0, missing = 0 } = {}) {
 	const runs: Run[] = [];
 	const run = (command: string, args: string[], { cwd, env }: { cwd: string; env: Record<string, string> }) => {
 		runs.push({ command, args, cwd, env, files: Object.fromEntries(readdirSync(cwd).map((name) => [name, readFileSync(join(cwd, name), "utf8")])) });
+		// As pnpm 11.1.1 prints it, on stdout, before the registry lists a just-published version.
+		const name = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8")).version;
+		if (runs.length <= missing) return { status: 1, stdout: `[ERR_PNPM_NO_MATCHING_VERSION] No matching version found for gentle-pi@${name} while fetching it from https://registry.npmjs.org/\n`, stderr: "" };
 		if (status !== 0) return { status, stdout: "", stderr: "ERR_PNPM_FETCH_404" };
 		writeFileSync(join(cwd, "pnpm-lock.yaml"), lockfile);
 		if (rewrite) writeFileSync(join(cwd, "pnpm-workspace.yaml"), "allowBuilds:\n  gentle-pi: true\n  koffi: set this to true or false\nstrictDepBuilds: false\n");
@@ -71,8 +79,8 @@ test("readDistribution accepts only an unchanged pair whose workspace files are 
 	assert.deepEqual(readDistribution(tampered((value) => { value.generatedWith.pnpm = "11.2.0"; }), LOCKFILE).manifest, manifest);
 });
 
-posixTest("buildDistribution resolves the lockfile with our pnpm from the unmodified distribution files and returns both assets", async () => {
-	const layout = claimed();
+posixTest("buildDistribution resolves the lockfile with our pnpm from the unmodified distribution files and returns both assets", async (t) => {
+	const layout = claimed(t);
 	const resolver = fakeResolver({ rewrite: true });
 	const env = { PATH: "/usr/bin", npm_config_registry: "http://user.example" };
 	const result = await buildDistribution({ layout, shell: "4.1.0", pi: "1.0.2", env, adapters: { run: resolver.run } });
@@ -94,8 +102,8 @@ posixTest("buildDistribution resolves the lockfile with our pnpm from the unmodi
 	assert.deepEqual(again.assets, result.assets, "the same lockfile gives byte-identical assets");
 });
 
-posixTest("buildDistribution pins Pi to PI_INSTALL_VERSION and refuses a non-exact version or a failed resolution before publishing anything", async () => {
-	const layout = claimed();
+posixTest("buildDistribution pins Pi to PI_INSTALL_VERSION and refuses a non-exact version or a failed resolution before publishing anything", async (t) => {
+	const layout = claimed(t);
 	const pinned = await buildDistribution({ layout, shell: "4.1.0", adapters: { run: fakeResolver().run } });
 	assert.deepEqual(pinned.manifest, { shell: "4.1.0", pi: PI_INSTALL_VERSION });
 	assert.equal(JSON.parse(pinned.assets[DISTRIBUTION_ASSETS.distribution]).pi, PI_INSTALL_VERSION);
@@ -104,14 +112,16 @@ posixTest("buildDistribution pins Pi to PI_INSTALL_VERSION and refuses a non-exa
 		await assert.rejects(buildDistribution({ layout, shell, pi, adapters: { run: resolver.run } }), /version rejected/, `${shell} ${pi}`);
 		assert.equal(resolver.runs.length, 0, "pnpm never runs for a non-exact version");
 	}
-	await assert.rejects(buildDistribution({ layout, shell: "4.1.0", pi: "1.0.2", adapters: { run: fakeResolver({ status: 1 }).run } }),
-		(error: Error & { stderr?: string }) => /lockfile resolution failed/.test(error.message) && error.stderr === "ERR_PNPM_FETCH_404");
+	const failed = fakeResolver({ status: 1 });
+	await assert.rejects(buildDistribution({ layout, shell: "4.1.0", pi: "1.0.2", adapters: { run: failed.run, sleep: async () => {} } }),
+		(error: Error & { output?: string }) => /lockfile resolution failed/.test(error.message) && error.output === "ERR_PNPM_FETCH_404");
+	assert.equal(failed.runs.length, 1, "only a gentle-pi missing from the registry is retried");
 	await assert.rejects(buildDistribution({ layout, shell: "4.1.0", pi: "1.0.2", adapters: { run: fakeResolver({ lockfile: "" }).run } }), /lockfile/i);
 	assert.deepEqual(readdirSync(layout.tmp), [], "no resolution folder is left behind");
 });
 
-posixTest("the assets install with installVersion: it writes the recorded workspace files and the lockfile byte for byte", async () => {
-	const layout = claimed();
+posixTest("the assets install with installVersion: it writes the recorded workspace files and the lockfile byte for byte", async (t) => {
+	const layout = claimed(t);
 	const { assets } = await buildDistribution({ layout, shell: "4.1.0", pi: "1.0.2", adapters: { run: fakeResolver().run } });
 	const { manifest: read, lockfile } = readDistribution(assets[DISTRIBUTION_ASSETS.distribution], assets[DISTRIBUTION_ASSETS.lockfile]);
 	let written: Record<string, string> = {};
@@ -130,8 +140,8 @@ posixTest("the assets install with installVersion: it writes the recorded worksp
 	assert.deepEqual(written, { ...recorded, "pnpm-lock.yaml": assets[DISTRIBUTION_ASSETS.lockfile] });
 });
 
-posixTest("verifyDistribution installs the pair with our runtimes, activates it and requires the launcher to report both exact versions", async () => {
-	const layout = claimed();
+posixTest("verifyDistribution installs the pair with our runtimes, activates it and requires the launcher to report both exact versions", async (t) => {
+	const layout = claimed(t);
 	// Runtimes already published under their pinned URLs are reused, so nothing is downloaded.
 	for (const [name, directory, entry] of [["node", layout.nodeDir, layout.node], ["pnpm", layout.pnpmDir, layout.pnpm]]) {
 		mkdirSync(dirname(entry), { recursive: true });
@@ -161,6 +171,60 @@ posixTest("verifyDistribution installs the pair with our runtimes, activates it 
 	await assert.rejects(verifyDistribution({ ...options, adapters: { run, launch: launch("gentle-shell 4.1.0\npi 1.1.0\n") } }), /launcher reported/);
 	await assert.rejects(verifyDistribution({ ...options, adapters: { run, launch: () => ({ status: 1, stdout: "", stderr: "boom" }) } }), /launcher reported/);
 	await assert.rejects(verifyDistribution({ ...options, lockfile: `${LOCKFILE}x`, adapters: { run, launch: launch("") } }), /lockfile sha256/);
+	// The launcher runs in the same filtered environment as our pnpm, without Pi or Gentle overrides.
+	const host = { HOME: "/h", PATH: "/usr/bin", NODE_OPTIONS: "--require /x.js", NODE_PATH: "/x", npm_config_prefix: "/x", PNPM_HOME: "/x", PI_CODING_AGENT_DIR: "/x", GENTLE_SHELL_PI: "/x" };
+	let seen: Record<string, string> = {};
+	await verifyDistribution({ ...options, env: host, adapters: { run, launch: (_launcher: string, { env }: { env: Record<string, string> }) => {
+		seen = env; return { status: 0, stdout: "gentle-shell 4.1.0\npi 1.0.2\n", stderr: "" };
+	} } });
+	const { PI_CODING_AGENT_DIR: _pi, GENTLE_SHELL_PI: _shell, ...kept } = host;
+	assert.deepEqual(seen, pnpmEnvironment(layout, { platform: "darwin", env: kept }));
+	for (const key of ["NODE_OPTIONS", "NODE_PATH", "npm_config_prefix", "PI_CODING_AGENT_DIR", "GENTLE_SHELL_PI"]) assert.equal(key in seen, false, key);
+	assert.equal(seen.PATH.split(":")[0], dirname(layout.node), "our Node first on PATH");
+});
+
+posixTest("buildDistribution retries while the just-published gentle-pi is not on the registry, then fails clearly", async (t) => {
+	const layout = claimed(t);
+	const waits: number[] = [];
+	const sleep = async (ms: number) => { waits.push(ms); };
+	const late = fakeResolver({ missing: 2 });
+	const result = await buildDistribution({ layout, shell: "4.1.0", pi: "1.0.2", adapters: { run: late.run, sleep } });
+	assert.equal(result.assets[DISTRIBUTION_ASSETS.lockfile], LOCKFILE);
+	assert.equal(late.runs.length, 3);
+	assert.deepEqual(waits, [30000, 30000]);
+	assert.equal(new Set(late.runs.map((run) => run.cwd)).size, 3, "each attempt resolves in a fresh folder");
+	for (const run of late.runs) assert.deepEqual(run.files, distributionFiles(manifest));
+	waits.length = 0;
+	const never = fakeResolver({ missing: 99 });
+	await assert.rejects(buildDistribution({ layout, shell: "4.1.0", pi: "1.0.2", adapters: { run: never.run, sleep } }),
+		(error: Error & { output?: string }) => /gentle-pi@4\.1\.0 is not on the registry after 10 attempts/.test(error.message) && /ERR_PNPM_NO_MATCHING_VERSION/.test(error.output ?? ""));
+	assert.equal(never.runs.length, 10);
+	assert.equal(waits.reduce((sum, ms) => sum + ms, 0), 270000, "about five minutes in all");
+	// A missing Pi, or another gentle-pi version, is a real failure: never retried.
+	for (const missing of ["@earendil-works/pi-coding-agent@1.0.2", "gentle-pi@4.1.0-beta.1", "gentle-pi@4.1.01"]) {
+		let runs = 0;
+		const run = () => { runs += 1; return { status: 1, stdout: `[ERR_PNPM_NO_MATCHING_VERSION] No matching version found for ${missing} while fetching it\n`, stderr: "" }; };
+		await assert.rejects(buildDistribution({ layout, shell: "4.1.0", pi: "1.0.2", adapters: { run, sleep } }), /lockfile resolution failed/, missing);
+		assert.equal(runs, 1, missing);
+	}
+	assert.deepEqual(readdirSync(layout.tmp), [], "no resolution folder is left behind");
+});
+
+posixTest("the CLI removes the temporary prefix it created when build or verify fails, and refuses bad input before creating one", async (t) => {
+	const root = temporary(t);
+	const options = { temporaryRoot: root, env: { PATH: "/usr/bin" }, adapters: { download: async () => Buffer.from("not the pinned archive") } };
+	await assert.rejects(main(["verify", "--assets", join(root, "missing")], options), /ENOENT/);
+	assert.deepEqual(readdirSync(root), [], "verify with unreadable assets");
+	const assets = join(root, "assets"); mkdirSync(assets);
+	writeFileSync(join(assets, DISTRIBUTION_ASSETS.distribution), distributionAsset(manifest, LOCKFILE));
+	writeFileSync(join(assets, DISTRIBUTION_ASSETS.lockfile), LOCKFILE);
+	await assert.rejects(main(["verify", "--assets", assets], options), /Download integrity mismatch/);
+	assert.deepEqual(readdirSync(root), ["assets"], "verify whose runtime download fails");
+	await assert.rejects(main(["build", "--shell", "4.1.0", "--out", join(root, "out")], options), /Download integrity mismatch/);
+	assert.deepEqual(readdirSync(root), ["assets"], "build whose runtime download fails");
+	await assert.rejects(main(["build", "--shell", "^4.1.0", "--out", join(root, "out")], options), /version rejected/);
+	await assert.rejects(main(["publish"], options), /Usage/);
+	assert.deepEqual(readdirSync(root), ["assets"]);
 });
 
 // publish.yml: the distribution assets reach the release only after the frozen

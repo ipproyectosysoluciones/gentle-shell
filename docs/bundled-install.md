@@ -76,6 +76,7 @@ Each release publishes two assets with stable names. `scripts/build-distribution
 
 - **Exact versions.** `shell` is the release version. `pi` is `PI_INSTALL_VERSION` from `scripts/installer-preflight.mjs`, the one Pi pin. A range, a tag such as `latest`, a `v` prefix or build metadata is refused before pnpm runs.
 - **Resolution.** `buildDistribution` writes `distributionFiles()` into a fresh folder under the prefix's `tmp/` and runs our pinned pnpm with `install --lockfile-only` in `pnpmEnvironment(layout)`, the environment `installVersion` uses. Only `pnpm-lock.yaml` is read back.
+- **Just published.** The registry may not list `gentle-pi@<version>` for a few minutes after `npm publish`. When pnpm reports `ERR_PNPM_NO_MATCHING_VERSION` for exactly that gentle-pi (pnpm prints it on stdout), the resolution is retried in a fresh folder: 10 attempts, 30 seconds apart, about five minutes in all. It then fails with `gentle-pi@<version> is not on the registry after 10 attempts`. Any other failure, including a missing Pi, stops at once.
 - **Deterministic.** `distributionAsset(manifest, lockfile)` is plain data in a fixed order, so the same inputs give the same bytes. The lockfile itself records the registry at resolution time, which is why it is built once per release and then only installed.
 - **Reading.** `readDistribution(json, lockfile)` returns `{ manifest, lockfile }` only when the versions are exact, the lockfile matches the recorded `sha256`, and `files` equals what this module's `installVersion` writes. `generatedWith` is recorded and not compared.
 
@@ -89,6 +90,22 @@ Observed with pnpm 11.1.1 for gentle-pi 4.0.0 and Pi 1.0.0:
 - A `--frozen-lockfile` install of that lockfile on macOS with `supportedArchitectures` forced to Linux and Windows installed the Linux and Windows variants. The lockfile was left unchanged.
 - The regular frozen install on macOS installed only the darwin-arm64 variants.
 
+### Minimum release age
+
+pnpm 11.1.1 defaults `minimum-release-age` to 1440 minutes (one day), in non-strict mode. The default is kept on purpose, and no value is set:
+
+- **Ranged dependencies.** For a ranged transitive dependency, pnpm picks the highest matching version that is at least one day old. A version published minutes before a release does not enter the lockfile. This is a supply-chain guard.
+- **Exact pins.** gentle-pi and Pi are exact. In non-strict mode, when no matching version is old enough, pnpm falls back to the matching version anyway (`pickRespectingMinReleaseAge`). So a gentle-pi published minutes ago still resolves.
+- **Never set it explicitly.** pnpm 11.1.1 turns `minimumReleaseAgeStrict` on whenever `minimumReleaseAge` is set explicitly and the strict flag is not. A strict check would refuse the gentle-pi the release just published.
+
+Observed with pnpm 11.1.1:
+
+- `pnpm_config_minimum_release_age=5256000` alone failed.
+- The same value with `pnpm_config_minimum_release_age_strict=false` resolved gentle-pi 4.0.0 exactly.
+- The default resolved it too.
+
+`pnpmEnvironment` drops every inherited `pnpm_*` variable, so a host setting cannot change this.
+
 ### Release workflow
 
 `.github/workflows/publish.yml` runs three jobs after `publish`, because `gentle-pi@<version>` must resolve from npm first:
@@ -100,8 +117,10 @@ Observed with pnpm 11.1.1 for gentle-pi 4.0.0 and Pi 1.0.0:
    - switches `current` and writes the launcher;
    - requires `gentle-shell --version` to report exactly `gentle-shell <shell>` and `pi <pi>`.
 
-   On Windows a fresh temporary folder stands in for the private-folder claim, which has its own native tests.
+   On Windows a fresh temporary folder stands in for the private-folder claim, which has its own native tests. The launcher runs in `pnpmEnvironment`, the environment our pnpm ran in, without any `PI_*` or `GENTLE_*` variable. So no host `NODE_OPTIONS`, `NODE_PATH`, npm or pnpm setting, or Pi override reaches it.
 3. **`distribution-assets`** runs only after every verify lane passed. It attaches both files to the release with `gh release upload --clobber`.
+
+Both `build` and `verify` create their temporary prefix (`gsd-*` in the system temporary folder) only after their arguments are accepted. They always remove it, whether the command succeeded or failed.
 
 The release gets the same bytes that the three systems installed.
 
