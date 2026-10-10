@@ -81,7 +81,9 @@ const probeNames = ["node", "pnpm", "pi", "shell", "gentleAi", "go", "globalBin"
  * pnpm may add found: the stable version of the older or incompatible one on the
  * user's PATH that the bootstrap left in place; a pnpm probe for the user's own
  * pnpm in `$PNPM_HOME/bin` (where persisting pnpm writes) adds inGlobalBin:true
- * and reports that pnpm itself, never as found. globalBin returns { available, path, writable, onPath } for
+ * and reports that pnpm itself, never as found, or, when that pnpm is never run
+ * (untrusted:true) or reports no stable version (unchecked:true), the bootstrap's
+ * pnpm in its place with persistent:true. globalBin returns { available, path, writable, onPath } for
  * pnpmGlobalBin's `$PNPM_HOME/bin` directory; setup returns boolean, or
  * { available: true, recoverable: true } for the pinned stack this pnpm installed
  * whose setup did not finish (only its setup is then planned).
@@ -219,6 +221,11 @@ export function planPreflight(inventory, { channel = "release" } = {}) {
 	// packageManager pins the acquisition choice, not a minimum supported pnpm.
 	// Existing versions require explicit engine/capability evidence from the probe.
 	record("pnpm", classify(inventory.pnpm, "0.0.0", (o) => o.compatible), requirements.pnpm);
+	// A user's pnpm in $PNPM_HOME/bin that could not be checked is left as it is while
+	// the bootstrap's pnpm runs the installer; the plan copy says so before consent.
+	if (tools.pnpm.status === "reusable" && inventory.pnpm.inGlobalBin === true && inventory.pnpm.unchecked === true) {
+		tools.pnpm = { ...tools.pnpm, unchecked: true };
+	}
 	// An older Node or an incompatible pnpm on the user's PATH is left as it is: the
 	// bootstrap acquired its pinned copy, which the probe reports (bootstrap-only)
 	// with the user's stable version as `found`. That copy runs the installer and

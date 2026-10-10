@@ -391,6 +391,36 @@ test("/api/plan says before consent which Go is downloaded, only to build, with 
 	}
 });
 
+test("/api/plan says before consent that a pnpm in $PNPM_HOME/bin that could not be checked is left as it is", async () => {
+	const note = "The pnpm in the pnpm global bin directory could not be checked, so it was left as it is, and the installer uses its own verified pnpm for this installation.";
+	const pnpm = { available: true, version: requirements.pnpm, usable: true, compatible: true, persistent: true, inGlobalBin: true, unchecked: true };
+	const cases = [
+		[{ available: true, version: "24.18.0", usable: true, persistent: true, npm: true }, [], `No runtime needs to be installed under $PNPM_HOME. ${note}`],
+		[{ available: true, version: "24.21.0", usable: true, persistent: false, npm: false }, ["node", "npm"], null],
+	] as const;
+	for (const [node, tools, exact] of cases) {
+		const { host, port, login, runs } = await start({ collect: async () => collected({ node, pnpm }) });
+		try {
+			const view = await plan(port, await login());
+			assert.deepEqual(view.blockers, []);
+			assert.equal(view.ready, false);
+			assert.deepEqual(view.persistence.tools, tools);
+			if (exact) assert.equal(view.persistence.description, exact);
+			else assert.ok(view.persistence.description.endsWith(` ${note}`), view.persistence.description);
+			assert.deepEqual(runs, []);
+		} finally {
+			await host.close("test");
+		}
+	}
+	// A checked pnpm there adds nothing.
+	const checked = await start({ collect: async () => collected({ pnpm: { ...pnpm, unchecked: undefined } }) });
+	try {
+		assert.doesNotMatch((await plan(checked.port, await checked.login())).persistence.description, /could not be checked/);
+	} finally {
+		await checked.host.close("test");
+	}
+});
+
 test("/api/plan explains a pnpm in $PNPM_HOME/bin that the installer will not replace, with how to update it", async () => {
 	const inGlobalBin = (pnpm: object) => ({ pnpm: { ...pnpm, inGlobalBin: true } });
 	const cases = [

@@ -283,9 +283,13 @@ test("a user's pnpm in $PNPM_HOME/bin is reported as it is next to the bootstrap
 		const h = probes({ env, files: [TOOLS_PNPM, `${BIN}/pnpm`], results: { ...results, [`${BIN}/pnpm --version`]: { code: 0, stdout: `${own}\n` } } });
 		assert.deepEqual(await h.probes.pnpm(), { available: true, version: own, usable: true, compatible: false, persistent: true, inGlobalBin: true }, own);
 	}
-	// Without a version it is unknown, still never replaced.
-	const unread = probes({ env, files: [TOOLS_PNPM, `${BIN}/pnpm`], results: { ...results, [`${BIN}/pnpm --version`]: { code: 2 } } });
-	assert.deepEqual(await unread.probes.pnpm(), { available: null, inGlobalBin: true });
+	// Without a stable version it is left as it is and never replaced: the bootstrap's
+	// pnpm is reported in its place, as persistent, so nothing is persisted over it.
+	const unchecked = { available: true, version: "11.1.1", usable: true, compatible: true, persistent: true, inGlobalBin: true, unchecked: true };
+	for (const read of [{ code: 2 }, { code: 0, stdout: "11.2.0-rc.1\n" }, { code: 0, stdout: "" }, { code: null, timedOut: true }]) {
+		const unread = probes({ env, files: [TOOLS_PNPM, `${BIN}/pnpm`], results: { ...results, [`${BIN}/pnpm --version`]: read } });
+		assert.deepEqual(await unread.probes.pnpm(), unchecked, JSON.stringify(read));
+	}
 	// A compatible one there needs nothing persisted over it.
 	const current = probes({ env, files: [TOOLS_PNPM, `${BIN}/pnpm`], results: { ...results, [`${BIN}/pnpm --version`]: { code: 0, stdout: "11.5.0\n" } } });
 	assert.deepEqual(await current.probes.pnpm(), { available: true, version: "11.5.0", usable: true, compatible: true, persistent: true, inGlobalBin: true });
@@ -304,7 +308,7 @@ test("a user's pnpm in $PNPM_HOME/bin is reported as it is next to the bootstrap
 	// The same user pnpm outside $PNPM_HOME/bin keeps the pinned copy alongside.
 	const outside = probes({ files: [TOOLS_PNPM, "/usr/bin/pnpm"], results: { ...results, "/usr/bin/pnpm --version": { code: 0, stdout: "11.0.5\n" } } });
 	assert.deepEqual(await outside.probes.pnpm(), { available: true, version: "11.1.1", usable: true, compatible: true, persistent: false, found: "11.0.5" });
-	// Windows cannot run the user's pnpm.cmd for its version: one in $PNPM_HOME\bin is unknown.
+	// A pnpm.cmd in $PNPM_HOME\bin whose shim is not recognized is never run, and left as it is.
 	const local = "C:\\Users\\u\\AppData\\Local";
 	const tools = `${local}\\.gentle-shell-bootstrap-tools.1`;
 	const node = `${tools}\\node\\node.exe`;
@@ -313,7 +317,8 @@ test("a user's pnpm in $PNPM_HOME/bin is reported as it is next to the bootstrap
 		GENTLE_INSTALL_PNPM_NODE: node, GENTLE_INSTALL_PNPM_ENTRY: entry };
 	const windows = probes({ platform: "win32", env: windowsEnv, files: [`${local}\\pnpm\\bin\\pnpm.cmd`],
 		results: { [`${node} ${entry} --version`]: { code: 0, stdout: "11.1.1\r\n" } } });
-	assert.deepEqual(await windows.probes.pnpm(), { available: null, inGlobalBin: true });
+	assert.deepEqual(await windows.probes.pnpm(), unchecked);
+	assert.deepEqual(windows.calls.map((call) => call.command), [node]);
 });
 
 test("Windows pnpm uses the direct bootstrap handoff; a .cmd shim alone is unknown", async () => {
@@ -382,6 +387,14 @@ test("Windows: a user's pnpm in $PNPM_HOME\\bin is run through its shim for the 
 	results: { [`${W_TOOLS_NODE} ${W_TOOLS_ENTRY} --version`]: { code: 0, stdout: "11.1.1\r\n" }, [`${exe} --version`]: { code: 0, stdout: "11.0.5\r\n" } } });
 	assert.deepEqual(await h.probes.pnpm(), { available: true, version: "11.0.5", usable: true, compatible: false, persistent: true, inGlobalBin: true });
 	assert.deepEqual(h.calls.find((call) => call.command === exe)?.cwd, "C:\\");
+	// One whose version cannot be read is left as it is: the bootstrap's pnpm is reported in its place.
+	const unread = probes({ platform: "win32", env: { LOCALAPPDATA: W_LOCAL, USERPROFILE: "C:\\Users\\u", Path: bin, GENTLE_BOOTSTRAP_TOOLS: W_TOOLS,
+		GENTLE_INSTALL_PNPM_NODE: W_TOOLS_NODE, GENTLE_INSTALL_PNPM_ENTRY: W_TOOLS_ENTRY },
+	files: [`${bin}\\pnpm.cmd`, `${bin}\\pnpm`, exe],
+	texts: { [`${bin}\\pnpm.cmd`]: "@SETLOCAL\r\n@\"%~dp0\\..\\global\\v11\\5f1a\\node_modules\\@pnpm\\exe\\pnpm.exe\"   %*\r\n" },
+	results: { [`${W_TOOLS_NODE} ${W_TOOLS_ENTRY} --version`]: { code: 0, stdout: "11.1.1\r\n" }, [`${exe} --version`]: { code: null, timedOut: true } } });
+	assert.deepEqual(await unread.probes.pnpm(), { available: true, version: "11.1.1", usable: true, compatible: true, persistent: true, inGlobalBin: true, unchecked: true });
+	assert.equal(unread.calls.filter((call) => call.command === exe).length, 1);
 });
 
 // S8: an npm-owned Gentle Shell on Windows is found through what its shim runs, so the
@@ -432,11 +445,12 @@ test("Windows: a user's pnpm in $PNPM_HOME\\bin that fails the walk is not run, 
 	assert.deepEqual(plan.blockers, []);
 	assert.equal(plan.tools.pnpm.status, "reusable");
 	assert.equal(plan.actions.some((action: { id: string }) => action.id.startsWith("persist-")), false);
-	// A shim no structure resolves there is still unknown, as before.
+	// A shim no structure resolves there is never run either: the bootstrap's pnpm is reported in its place.
 	const unresolved = probes({ platform: "win32", env: { LOCALAPPDATA: W_LOCAL, Path: bin, GENTLE_INSTALL_PNPM_NODE: W_TOOLS_NODE, GENTLE_INSTALL_PNPM_ENTRY: W_TOOLS_ENTRY,
 		GENTLE_BOOTSTRAP_TOOLS: W_TOOLS }, files: [`${bin}\\pnpm.cmd`], texts: { [`${bin}\\pnpm.cmd`]: "@echo off\r\nvolta run %~n0 %*\r\n" },
 	results: { [`${W_TOOLS_NODE} ${W_TOOLS_ENTRY} --version`]: { code: 0, stdout: "11.1.1\r\n" } } });
-	assert.deepEqual(await unresolved.probes.pnpm(), { available: null, inGlobalBin: true });
+	assert.deepEqual(await unresolved.probes.pnpm(), { available: true, version: "11.1.1", usable: true, compatible: true, persistent: true, inGlobalBin: true, unchecked: true });
+	assert.equal(unresolved.calls.some((call) => call.command !== W_TOOLS_NODE), false, "the user's pnpm never runs");
 });
 
 // S6 notice: every reused tool's command, and what it runs, walked in one launch.
