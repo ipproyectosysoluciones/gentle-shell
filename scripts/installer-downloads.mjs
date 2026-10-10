@@ -65,8 +65,16 @@ export function artifactFor(name, platform, arch) {
 }
 
 async function download(descriptor) {
-	const response = await fetch(descriptor.url, { redirect: "error", signal: AbortSignal.timeout(60000) });
-	if (!response.ok || !response.body) throw new Error("Download failed");
+	// identity: fetch would otherwise accept gzip and decode it, so the advertised
+	// length (dl.google.com gzips archives on request) would not match the bytes.
+	const response = await fetch(descriptor.url, { redirect: "error", headers: { "accept-encoding": "identity" },
+		signal: AbortSignal.timeout(60000) });
+	if (!response.ok || !response.body) throw new Error(`Download responded ${response.status}`);
+	const encoding = response.headers.get("content-encoding");
+	if (encoding && encoding.toLowerCase() !== "identity") {
+		await response.body.cancel();
+		throw new Error(`Download was encoded (${encoding}) although identity was requested`);
+	}
 	const advertised = response.headers.get("content-length");
 	if (advertised && (!/^\d+$/.test(advertised) || Number(advertised) > descriptor.maxBytes)) {
 		await response.body.cancel();
@@ -100,7 +108,7 @@ export async function verifiedDownload(name, adapters = {}, platform, arch) {
 	const descriptor = (adapters.artifact ?? artifactFor)(name, platform, arch);
 	let bytes;
 	try { bytes = await (adapters.download ?? download)(descriptor); }
-	catch { throw new Error("Download failed"); }
+	catch (cause) { throw new Error("Download failed", { cause }); }
 	if (!Buffer.isBuffer(bytes) || bytes.length === 0 || bytes.length > descriptor.maxBytes) throw new Error("Download size rejected");
 	if (descriptor.size !== undefined && bytes.length !== descriptor.size) throw new Error("Download size rejected");
 	const [algorithm, encoded] = descriptor.integrity.split("-");
