@@ -63,7 +63,47 @@ These settings mean:
 
 `installVersion` then runs `node pnpm.mjs install --frozen-lockfile` in the version folder.
 
-After an install that skips build scripts, pnpm 11 rewrites `pnpm-workspace.yaml` in place. It adds each skipped package under `allowBuilds` with the placeholder value `set this to true or false`. The release lockfile (T1b) must therefore be resolved from the unmodified `distributionFiles()` output. It must never come from a `pnpm-workspace.yaml` read back from a folder pnpm already installed into.
+After an install that skips build scripts, pnpm 11 rewrites `pnpm-workspace.yaml` in place. It adds each skipped package under `allowBuilds` with the placeholder value `set this to true or false`. The release lockfile is therefore resolved from the unmodified `distributionFiles()` output. It never comes from a `pnpm-workspace.yaml` read back from a folder pnpm already installed into.
+
+## Release distribution assets
+
+Each release publishes two assets with stable names. `scripts/build-distribution.mjs` builds and verifies them.
+
+| Asset | Contents |
+|---|---|
+| `gentle-shell-distribution.json` | `schema` (1), `shell` (gentle-pi), `pi`, `id` (`<shell>-<pi>`), `generatedWith` (our Node and pnpm pins), `files` (the exact `package.json` and `pnpm-workspace.yaml` that `installVersion` writes) and `lockfile` (`name` and `sha256`). |
+| `gentle-shell-distribution-lock.yaml` | The `pnpm-lock.yaml` for those files. |
+
+- **Exact versions.** `shell` is the release version. `pi` is `PI_INSTALL_VERSION` from `scripts/installer-preflight.mjs`, the one Pi pin. A range, a tag such as `latest`, a `v` prefix or build metadata is refused before pnpm runs.
+- **Resolution.** `buildDistribution` writes `distributionFiles()` into a fresh folder under the prefix's `tmp/` and runs our pinned pnpm with `install --lockfile-only` in `pnpmEnvironment(layout)`, the environment `installVersion` uses. Only `pnpm-lock.yaml` is read back.
+- **Deterministic.** `distributionAsset(manifest, lockfile)` is plain data in a fixed order, so the same inputs give the same bytes. The lockfile itself records the registry at resolution time, which is why it is built once per release and then only installed.
+- **Reading.** `readDistribution(json, lockfile)` returns `{ manifest, lockfile }` only when the versions are exact, the lockfile matches the recorded `sha256`, and `files` equals what this module's `installVersion` writes. `generatedWith` is recorded and not compared.
+
+### One lockfile for every system
+
+pnpm resolves every optional dependency into the lockfile, with its `os`, `cpu` and `libc` fields, whatever system resolves it. Only the install skips the packages for other systems. So no `supportedArchitectures` setting is needed, and none is set.
+
+Observed with pnpm 11.1.1 for gentle-pi 4.0.0 and Pi 1.0.0:
+
+- A lockfile resolved on macOS arm64 lists every `@yuuang/ffi-rs-*`, `@ff-labs/fff-bin-*` and `@esbuild/*` variant for Linux (gnu and musl), Windows and macOS.
+- A `--frozen-lockfile` install of that lockfile on macOS with `supportedArchitectures` forced to Linux and Windows installed the Linux and Windows variants. The lockfile was left unchanged.
+- The regular frozen install on macOS installed only the darwin-arm64 variants.
+
+### Release workflow
+
+`.github/workflows/publish.yml` runs three jobs after `publish`, because `gentle-pi@<version>` must resolve from npm first:
+
+1. **`distribution`** checks out the verified release commit. It runs `build-distribution.mjs build --shell <tag without v> --out <dir>` with our pinned Node and pnpm in a temporary prefix, and keeps both files as a workflow artifact.
+2. **`distribution-verify`** runs on `ubuntu-latest`, `macos-latest` and `windows-latest`. It runs `build-distribution.mjs verify --assets <dir>`, which:
+   - downloads our pinned Node and pnpm into a temporary prefix (with Go on Windows);
+   - installs the exact pair with `installVersion` (`--frozen-lockfile`);
+   - switches `current` and writes the launcher;
+   - requires `gentle-shell --version` to report exactly `gentle-shell <shell>` and `pi <pi>`.
+
+   On Windows a fresh temporary folder stands in for the private-folder claim, which has its own native tests.
+3. **`distribution-assets`** runs only after every verify lane passed. It attaches both files to the release with `gh release upload --clobber`.
+
+The release gets the same bytes that the three systems installed.
 
 ## npm is not needed
 
