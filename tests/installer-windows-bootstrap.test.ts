@@ -6,7 +6,7 @@ import { gzipSync } from "node:zlib";
 import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
-import { artifactFor, compatibleEngine, windowsBootstrapMessage } from "../scripts/installer-downloads.mjs";
+import { acquireGo, artifactFor, compatibleEngine, installedGo, windowsBootstrapMessage } from "../scripts/installer-downloads.mjs";
 import { createProbes, hostAdapters } from "../scripts/installer-probes.mjs";
 import { planPreflight } from "../scripts/installer-preflight.mjs";
 import { lookPath, upgradeInvocation, windowsInvocation } from "../scripts/installer-runner.mjs";
@@ -2122,6 +2122,21 @@ test("native Windows: the main channel extracts its source with System32's tar.e
 // Run 38063142924: from a 179-character package root (a pnpm 11 store path) Go's asm.exe failed
 // with "The directory name is invalid." while building inside the package. The real source
 // build (network: proxy.golang.org and sum.golang.org) from a root deeper than 200 characters.
+test("native Windows: the pinned Go downloads from go.dev, verifies and runs", { skip: nativeUnavailable }, async () => {
+	// The real transport: dl.google.com gzips archives unless identity is requested.
+	const root = mkdtempSync(join(tmpdir(), "gentle pinned go "));
+	try {
+		const result = await acquireGo({ root, platform: "win32", arch: process.arch });
+		assert.equal(result.acquired, true);
+		assert.equal(installedGo(root, "win32", process.arch), result.goPath);
+		const version = spawnSync(result.goPath, ["version"], { encoding: "utf8", env: { ...process.env, GOTOOLCHAIN: "local" } });
+		assert.equal(version.status, 0, version.stderr);
+		assert.match(version.stdout.trim(), new RegExp(`^go version go${result.version} windows/`));
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("native Windows: the Gentle AI source build succeeds from a package root deeper than 200 characters", { skip: nativeUnavailable }, async (t) => {
 	const installer = await import("../scripts/gentle-ai-installer.mjs");
 	const where = spawnSync(join(process.env.SystemRoot!, "System32", "where.exe"), ["go.exe"], { encoding: "utf8", windowsHide: true });
