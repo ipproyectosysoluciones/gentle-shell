@@ -6,14 +6,15 @@ import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import test, { after, type TestContext } from "node:test";
 import { crc32, gzipSync } from "node:zlib";
-import { activateVersion, activeVersion, applyPathEntry, claimPrefix, distributionFiles, ensureLauncher, ensureRuntime, installVersion, nodeExecutable,
-	pathEntryPlan, pnpmEnvironment, prefixLayout, pruneVersions, removePathEntry } from "../scripts/bundled-install.mjs";
+import { activateVersion, activeVersion, applyPathEntry, claimPrefix, distributionFiles, ensureLauncher, ensureRuntime, filterNpmrc, installVersion, nodeExecutable,
+	nodeRuntimeFiles, pathEntryPlan, pnpmEnvironment, prefixLayout, pruneVersions, removePathEntry, setupEnvironment, userNpmrc, writeNpmrcAuth } from "../scripts/bundled-install.mjs";
 
 // Real directories, modes, symlinks and uids need a POSIX host.
 const posixHost = process.platform === "win32" ? "POSIX filesystem fixtures need a POSIX host" : false;
 const posixTest = (name: string, fn: (t: TestContext) => void | Promise<void>) => test(name, { skip: posixHost }, fn);
 const NODE = "24.21.0";
 const PNPM = "11.1.1";
+const NPM = "11.19.0";
 
 // Every temporary home this file creates is removed when the file's tests end.
 const roots: string[] = [];
@@ -86,7 +87,14 @@ const nodeArchive = tarGz([
 	tarEntry(`${nodeStem}/bin/node`, { data: nodeBytes }),
 	// Links and every other member are skipped, never written.
 	tarEntry(`${nodeStem}/bin/npm`, { type: "2", link: "../lib/node_modules/npm/bin/npm-cli.js" }),
-	tarEntry(`${nodeStem}/lib/node_modules/npm/package.json`, { data: Buffer.from("{}") }),
+	tarEntry(`${nodeStem}/include/node/node.h`, { data: Buffer.from("header") }),
+	// npm, bundled in the same verified archive, is kept for Pi's package installs.
+	tarEntry(`${nodeStem}/lib/node_modules/npm/`, { type: "5" }),
+	tarEntry(`${nodeStem}/lib/node_modules/npm/package.json`, { data: Buffer.from(JSON.stringify({ name: "npm", version: NPM })) }),
+	tarEntry(`${nodeStem}/lib/node_modules/npm/bin/npm-cli.js`, { data: Buffer.from("// npm cli\n"), mode: "0000755" }),
+	tarEntry(`${nodeStem}/lib/node_modules/npm/bin/npx-cli.js`, { data: Buffer.from("// npx cli\n"), mode: "0000755" }),
+	tarEntry(`${nodeStem}/lib/node_modules/npm/bin/link`, { type: "2", link: "/etc/passwd" }),
+	tarEntry(`${nodeStem}/lib/node_modules/corepack/package.json`, { data: Buffer.from("{}") }),
 ]);
 const pnpmArchive = tarGz([
 	tarEntry("package/package.json", { data: Buffer.from(JSON.stringify({ name: "pnpm", version: PNPM, engines: { node: ">=22.13" }, bin: { pnpm: "bin/pnpm.mjs" } })) }),
@@ -107,7 +115,7 @@ function adapters(overrides: Record<string, unknown> = {}) {
 			run: (command: string, args: string[], options: { cwd: string; env: Record<string, string> }) => {
 				calls.runs.push({ command, args, ...options });
 				if (args.length === 1 && args[0] === "--version") return { status: 0, stdout: `v${NODE}\n`, stderr: "" };
-				if (args[1] === "--version") return { status: 0, stdout: `${PNPM}\n`, stderr: "" };
+				if (args[1] === "--version") return { status: 0, stdout: `${args[0].endsWith("npm-cli.js") ? NPM : PNPM}\n`, stderr: "" };
 				return { status: 1, stdout: "", stderr: "unexpected" };
 			},
 			...overrides,
@@ -230,14 +238,22 @@ posixTest("ensureRuntime installs the verified Node and pnpm into runtime/ and r
 	assert.equal(lstatSync(layout.pnpm).mode & 0o777, 0o700);
 	assert.equal(lstatSync(join(layout.pnpmDir, "package", "dist", "node-gyp-bin", "node-gyp")).mode & 0o777, 0o700);
 	assert.equal(lstatSync(join(layout.pnpmDir, "package", "package.json")).mode & 0o777, 0o600);
-	// Only the Node executable is published: no npm, no links.
-	assert.deepEqual(readdirSync(join(layout.runtime, `node-${NODE}`)).sort(), [".gentle-shell-runtime", "bin"]);
-	assert.deepEqual(readdirSync(join(layout.runtime, `node-${NODE}`, "bin")), ["node"]);
+	// The Node executable and its npm are published, no links: npm and npx are our own wrappers.
+	assert.deepEqual(readdirSync(join(layout.runtime, `node-${NODE}`)).sort(), [".gentle-shell-runtime", "bin", "lib"]);
+	assert.deepEqual(readdirSync(join(layout.runtime, `node-${NODE}`, "bin")).sort(), ["node", "npm", "npx"]);
+	assert.deepEqual(readdirSync(join(layout.runtime, `node-${NODE}`, "lib", "node_modules")), ["npm"]);
+	assert.deepEqual(readdirSync(join(layout.runtime, `node-${NODE}`, "lib", "node_modules", "npm", "bin")).sort(), ["npm-cli.js", "npx-cli.js"]);
+	assert.equal(readFileSync(layout.npmCli, "utf8"), "// npm cli\n");
+	assert.match(readFileSync(join(layout.nodeDir, "bin", "npm"), "utf8"), /exec "\$basedir\/node" "\$basedir\/\.\.\/lib\/node_modules\/npm\/bin\/npm-cli\.js" "\$@"/);
+	assert.equal(lstatSync(join(layout.nodeDir, "bin", "npx")).mode & 0o777, 0o700);
 	// Each is checked in its staging folder, before it is published.
-	const [nodeCheck, pnpmCheck] = calls.runs;
-	assert.equal(calls.runs.length, 2);
+	const [nodeCheck, npmCheck, pnpmCheck] = calls.runs;
+	assert.equal(calls.runs.length, 3);
 	assert.deepEqual(nodeCheck.args, ["--version"]);
 	assert.match(nodeCheck.command, /\/runtime\/\.stage-[^/]+\/bin\/node$/);
+	assert.equal(npmCheck.command, nodeCheck.command);
+	assert.match(npmCheck.args[0], /\/runtime\/\.stage-[^/]+\/lib\/node_modules\/npm\/bin\/npm-cli\.js$/);
+	assert.equal(npmCheck.args[1], "--version");
 	assert.equal(pnpmCheck.command, layout.node);
 	assert.match(pnpmCheck.args[0], /\/runtime\/\.stage-[^/]+\/package\/bin\/pnpm\.mjs$/);
 	assert.equal(pnpmCheck.args[1], "--version");
@@ -658,4 +674,101 @@ test("pathEntryPlan on Windows plans one HKCU Path entry applied through an inje
 	removePathEntry(plan, { registry: { add: () => {}, remove: (entry: string) => registry.push(`-${entry}`) } });
 	assert.deepEqual(registry, ["+C:\\L\\gentle-shell\\bin", "-C:\\L\\gentle-shell\\bin"]);
 	assert.throws(() => applyPathEntry(plan), /registry adapter/);
+});
+
+// Rule 6 (T1c): Pi installs its packages with npm, so our npm comes from the same verified Node archive.
+test("nodeRuntimeFiles takes node.exe, npm and its .cmd shims from the Windows zip, and node plus npm with our wrappers from the tarball", () => {
+	const stem = `node-v${NODE}-win-x64`;
+	const descriptor = { url: `https://nodejs.org/dist/v${NODE}/${stem}.zip` };
+	const archive = zip([[`${stem}/node.exe`, Buffer.from("MZ")], [`${stem}/npm.cmd`, Buffer.from("npm cmd")], [`${stem}/npx.cmd`, Buffer.from("npx cmd")],
+		[`${stem}/npm.ps1`, Buffer.from("ps")], [`${stem}/corepack.cmd`, Buffer.from("corepack")], [`${stem}/node_modules/npm/`, Buffer.alloc(0)],
+		[`${stem}/node_modules/npm/package.json`, Buffer.from(JSON.stringify({ name: "npm", version: NPM }))],
+		[`${stem}/node_modules/npm/bin/npm-cli.js`, Buffer.from("cli")], [`${stem}/node_modules/corepack/package.json`, Buffer.from("{}")]]);
+	const files = nodeRuntimeFiles(archive, descriptor);
+	assert.deepEqual(files.map((file: { name: string }) => file.name).sort(),
+		["node.exe", "node_modules/npm/bin/npm-cli.js", "node_modules/npm/package.json", "npm.cmd", "npx.cmd"]);
+	assert.equal(files.npm, NPM);
+	// No npm in the archive, or a member escaping the runtime folder, rejects the whole archive.
+	assert.throws(() => nodeRuntimeFiles(zip([[`${stem}/node.exe`, Buffer.from("MZ")]]), descriptor), /Node archive/);
+	assert.throws(() => nodeRuntimeFiles(zip([[`${stem}/node.exe`, Buffer.from("MZ")], [`${stem}/node_modules/npm/package.json`, Buffer.from(JSON.stringify({ name: "npm", version: NPM }))],
+		[`${stem}/node_modules/npm/bin/npm-cli.js`, Buffer.from("cli")], [`${stem}/node_modules/npm/../../evil.js`, Buffer.from("x")]]), descriptor), /Node archive/);
+	const tarball = nodeRuntimeFiles(nodeArchive, { url: `https://nodejs.org/dist/v${NODE}/${nodeStem}.tar.gz` });
+	assert.deepEqual(tarball.map((file: { name: string }) => file.name).sort(), ["bin/node", "bin/npm", "bin/npx", "lib/node_modules/npm/bin/npm-cli.js",
+		"lib/node_modules/npm/bin/npx-cli.js", "lib/node_modules/npm/package.json"]);
+	assert.deepEqual(tarball.filter((file: { executable: boolean }) => file.executable).map((file: { name: string }) => file.name).sort(),
+		["bin/node", "bin/npm", "bin/npx", "lib/node_modules/npm/bin/npm-cli.js", "lib/node_modules/npm/bin/npx-cli.js"]);
+});
+
+// S12: only the network, registry and authentication keys of the user's npmrc.
+test("filterNpmrc keeps registries, per-host credentials, proxies and TLS keys and drops everything else", () => {
+	const text = [
+		"; a comment", "# another", "registry=https://registry.example.com/", "@acme:registry = https://npm.acme.dev/",
+		"//npm.acme.dev/:_authToken=${ACME_TOKEN}", "//registry.example.com/:_auth=dXNlcjpwYXNz", "//host:8443/path/:username=me",
+		"//host:8443/path/:_password=c2VjcmV0", "//host:8443/path/:certfile=/certs/me.pem", "//host:8443/path/:keyfile=/certs/me.key",
+		"proxy=http://proxy:3128", "https-proxy=http://proxy:3128", "noproxy=localhost", "no-proxy=.internal", "ca=\"-----BEGIN CERTIFICATE-----\"",
+		"ca[]=second", "cafile=/certs/ca.pem", "strict-ssl=false", "\"//quoted.example/:_authToken\"=tok",
+		"prefix=/home/me/.npm-global", "cache=/tmp/cache", "ignore-scripts=true", "save-exact=true", "_authToken=legacy", "//h/:always-auth=true",
+		"node-options=--require /x.js", "script-shell=/bin/zsh", "global=true", "not a key", "=value", "",
+		"[section]", "registry=https://inside-a-section.example/",
+	].join("\r\n");
+	assert.equal(filterNpmrc(text), [
+		"registry=https://registry.example.com/", "@acme:registry = https://npm.acme.dev/", "//npm.acme.dev/:_authToken=${ACME_TOKEN}",
+		"//registry.example.com/:_auth=dXNlcjpwYXNz", "//host:8443/path/:username=me", "//host:8443/path/:_password=c2VjcmV0",
+		"//host:8443/path/:certfile=/certs/me.pem", "//host:8443/path/:keyfile=/certs/me.key", "proxy=http://proxy:3128", "https-proxy=http://proxy:3128",
+		"noproxy=localhost", "no-proxy=.internal", "ca=\"-----BEGIN CERTIFICATE-----\"", "ca[]=second", "cafile=/certs/ca.pem", "strict-ssl=false",
+		"\"//quoted.example/:_authToken\"=tok", "",
+	].join("\n"));
+	assert.equal(filterNpmrc(""), "");
+	assert.equal(filterNpmrc("save-exact=true\n"), "");
+});
+
+posixTest("writeNpmrcAuth writes the filtered npmrc 0600 inside the prefix; userNpmrc reads NPM_CONFIG_USERCONFIG, then ~/.npmrc", () => {
+	const { home: user, layout } = claimed();
+	assert.equal(userNpmrc({ platform: "darwin", env: {}, home: user }), "");
+	writeFileSync(join(user, ".npmrc"), "registry=https://home.example/\nsave-exact=true\n");
+	const custom = join(user, "custom.npmrc");
+	writeFileSync(custom, "registry=https://custom.example/\n");
+	assert.equal(userNpmrc({ platform: "darwin", env: {}, home: user }), "registry=https://home.example/\nsave-exact=true\n");
+	assert.equal(userNpmrc({ platform: "darwin", env: { npm_config_userconfig: custom }, home: user }), "registry=https://custom.example/\n");
+	assert.equal(userNpmrc({ platform: "darwin", env: { NPM_CONFIG_USERCONFIG: custom }, home: user }), "registry=https://custom.example/\n");
+	writeNpmrcAuth(layout, userNpmrc({ platform: "darwin", env: {}, home: user }));
+	assert.equal(readFileSync(layout.npmrc, "utf8"), "registry=https://home.example/\n");
+	assert.equal(lstatSync(layout.npmrc).mode & 0o777, 0o600);
+	writeNpmrcAuth(layout, "");
+	assert.equal(readFileSync(layout.npmrc, "utf8"), "");
+});
+
+test("pnpmEnvironment keeps the variables the prefix npmrc references and still drops npm settings", () => {
+	const user = home();
+	const layout = prefixLayout({ platform: "linux", env: {}, home: user });
+	mkdirSync(join(layout.root, "pnpm", "config"), { recursive: true });
+	writeFileSync(layout.npmrc, "//npm.acme.dev/:_authToken=${NPM_TOKEN}\n//h/:_auth=${npm_config_x}\n");
+	const env = pnpmEnvironment(layout, { platform: "linux", env: { PATH: "/usr/bin", NPM_TOKEN: "secret", NPM_OTHER: "o", npm_config_x: "x",
+		npm_config_cache: "/home/me/.npm" } });
+	// ${NPM_TOKEN} is expanded by pnpm from the environment, so it survives; npm settings and unreferenced npm_* never do.
+	assert.equal(env.NPM_TOKEN, "secret");
+	for (const key of ["NPM_OTHER", "npm_config_x", "npm_config_cache", "npm_config_userconfig", "npm_config_prefix"]) assert.equal(env[key], undefined, key);
+});
+
+test("setupEnvironment runs setup with our Node and npm, then the version's Pi, and keeps the user's XDG folders", () => {
+	const layout = prefixLayout({ platform: "linux", env: {}, home: "/home/me" });
+	const env = setupEnvironment(layout, { platform: "linux", id: "4.1.0-1.0.2", env: { PATH: "/usr/local/bin:/usr/bin", HOME: "/home/me",
+		XDG_CONFIG_HOME: "/home/me/.config", npm_config_registry: "https://user.example", NODE_OPTIONS: "--require /x.js", PNPM_HOME: "/p",
+		GENTLE_BOOTSTRAP_TOOLS: "/t", GENTLE_INSTALL_PNPM_ENTRY: "/e", NPM_TOKEN: "t" } });
+	const root = "/home/me/.gentle-shell";
+	assert.equal(env.PATH, `${root}/runtime/node-${NODE}/bin:${root}/versions/4.1.0-1.0.2/node_modules/.bin:/usr/local/bin:/usr/bin`);
+	assert.equal(env.XDG_CONFIG_HOME, "/home/me/.config");
+	// npm reads the filtered prefix npmrc and writes its global prefix and cache inside the prefix.
+	assert.equal(env.npm_config_userconfig, `${root}/pnpm/config/npmrc`);
+	assert.equal(env.npm_config_globalconfig, `${root}/npm/npmrc`);
+	assert.equal(env.npm_config_prefix, `${root}/npm/prefix`);
+	assert.equal(env.npm_config_cache, `${root}/npm/cache`);
+	assert.equal(env.npm_config_update_notifier, "false");
+	for (const key of ["npm_config_registry", "NODE_OPTIONS", "PNPM_HOME", "GENTLE_BOOTSTRAP_TOOLS", "GENTLE_INSTALL_PNPM_ENTRY"]) assert.equal(env[key], undefined, key);
+	assert.equal(env.NPM_TOKEN, "t");
+	assert.equal(env.HOME, "/home/me");
+	const windows = setupEnvironment(prefixLayout({ platform: "win32", env: { LOCALAPPDATA: "C:\\L" }, home: "C:\\U" }),
+		{ platform: "win32", id: "4.1.0-1.0.2", env: { Path: "C:\\Windows" } });
+	assert.equal(windows.Path, `C:\\L\\gentle-shell\\runtime\\node-${NODE};C:\\L\\gentle-shell\\versions\\4.1.0-1.0.2\\node_modules\\.bin;C:\\Windows`);
+	assert.throws(() => setupEnvironment(layout, { platform: "linux", id: "../x", env: {} }), /Unsafe version id/);
 });

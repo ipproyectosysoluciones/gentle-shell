@@ -64,12 +64,29 @@ export function artifactFor(name, platform, arch) {
 		integrity: `sha256-${hash}`, maxBytes: 100 * 1024 * 1024 });
 }
 
-async function download(descriptor) {
+/** The bytes at descriptor.url, at most descriptor.maxBytes. Redirects are
+ * refused, except up to 5 to an https host in descriptor.redirectHosts (GitHub
+ * serves release assets from another host). A non-2xx answer throws with its
+ * HTTP `status`.
+ */
+export async function download(descriptor) {
 	// identity: fetch would otherwise accept gzip and decode it, so the advertised
 	// length (dl.google.com gzips archives on request) would not match the bytes.
-	const response = await fetch(descriptor.url, { redirect: "error", headers: { "accept-encoding": "identity" },
-		signal: AbortSignal.timeout(60000) });
-	if (!response.ok || !response.body) throw new Error(`Download responded ${response.status}`);
+	const hosts = Array.isArray(descriptor.redirectHosts) ? descriptor.redirectHosts : null;
+	let url = descriptor.url;
+	let response;
+	for (let hops = 0; ; hops += 1) {
+		response = await fetch(url, { redirect: hosts ? "manual" : "error", headers: { "accept-encoding": "identity" }, signal: AbortSignal.timeout(60000) });
+		if (!hosts || ![301, 302, 303, 307, 308].includes(response.status)) break;
+		await response.body?.cancel();
+		const next = new URL(response.headers.get("location") ?? "", url);
+		if (hops >= 5 || next.protocol !== "https:" || !hosts.includes(next.hostname)) throw new Error("Download redirect rejected");
+		url = next.href;
+	}
+	if (!response.ok || !response.body) {
+		await response.body?.cancel();
+		throw Object.assign(new Error(`Download responded ${response.status}`), { status: response.status });
+	}
 	const encoding = response.headers.get("content-encoding");
 	if (encoding && encoding.toLowerCase() !== "identity") {
 		await response.body.cancel();

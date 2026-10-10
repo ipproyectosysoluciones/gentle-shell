@@ -4,17 +4,19 @@ import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, posix, resolve, win32 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { collectInventory, planPreflight, pnpmGlobalBin } from "../scripts/installer-preflight.mjs";
+import { collectInventory, planPreflight, pnpmGlobalBin, requirements } from "../scripts/installer-preflight.mjs";
 import { createProbes, hostAdapters, userEnvironment } from "../scripts/installer-probes.mjs";
 import { acquireGo } from "../scripts/installer-downloads.mjs";
 import { childEnvironment, goFirstEnvironment, lookPath, packageNativeGentleAi, pnpmInvocation, runStandardInstall, upgradeInvocation } from "../scripts/installer-runner.mjs";
 import { createInstallerServer } from "../scripts/installer-server.mjs";
 import { configHome, mainChannelAdapter, runUpgrade } from "../scripts/main-channel.mjs";
 import { ensureWindowsPnpmHome, windowsWizardEnvironment } from "../scripts/installer-windows.mjs";
+import { pathEntryPlan, prefixLayout } from "../scripts/bundled-install.mjs";
+import { DISTRIBUTION_RELEASES, bundledGate, bundledPlan, fetchDistribution, runBundledInstall, windowsPathRegistry } from "../scripts/bundled-wizard.mjs";
 
 // Browser installation wizard entry, started by the bootstrap with no argv.
-// Thin wiring only: real probes and adapters, the standard runner and the
-// loopback host. Exit 0 keeps the bootstrap's tools; nonzero removes them.
+// Thin wiring only: real probes and adapters, the standard or bundled runner
+// and the loopback host. Exit 0 keeps the bootstrap's tools; nonzero removes them.
 
 /** Fixed per-platform browser opener for a local file, spawned with shell:false; null when none. */
 export function openerFor(platform, file, env) {
@@ -130,30 +132,46 @@ export function upgradeEnvironment({ platform, env, pnpmHome, goPath }) {
 	return goPath ? goFirstEnvironment(base, platform, goPath) : base;
 }
 
-async function main() {
-	const { platform, arch, env } = process;
-	const { run, fs } = hostAdapters();
-	// The redirect file is removed once the code is redeemed, or when the host closes.
-	let redeemed = false;
-	let redirect = null;
+/** The wizard host's collectPlan and runInstall. Every plan starts from a fresh
+ * preflight. A new release installation whose release publishes the
+ * distribution assets gets the bundled plan (bundledGate) and the bundled
+ * runner; everything else gets planPreflight and the standard runner, unchanged.
+ * `distributionBase`, `download` and `inventory` are trusted local overrides
+ * for tests and local checks.
+ */
+export function wizardHandlers({ platform, arch, env, run, fs, distributionBase = DISTRIBUTION_RELEASES, download, inventory: inventoryFor }) {
 	// Windows: the PNPM_HOME decision (S6) is made before any probe, on every
 	// preflight. The server re-collects right before an installation, so the
 	// installation uses the decision its consented plan was checked against.
 	let wizard = { env, pnpmHome: null };
+	// The distribution assets the latest bundled plan was made from; the bundled
+	// runner checks them against the consented plan's lockfile sha256.
+	let distribution = null;
 	const decide = () => (wizard = platform === "win32" ? windowsWizardEnvironment({ env }) : { env, pnpmHome: null });
-	const host = createInstallerServer({
-		onRedeemed: () => {
-			redeemed = true;
-			void redirect?.remove();
-		},
-		assetsDir: fileURLToPath(new URL("../assets/install-wizard/", import.meta.url)),
+	// The user's own PATH and home (no bootstrap tools) for the bundled install's PATH entry and setup.
+	const user = userEnvironment({ platform, env });
+	const home = platform === "win32" ? env.USERPROFILE : env.HOME;
+	return {
 		collectPlan: async (channel) => {
 			const { env: wizardEnv, pnpmHome } = decide();
 			// Fresh probes every time: createProbes caches its global package listing.
-			const inventory = await collectInventory({ platform, arch, probes: createProbes({ platform, env: wizardEnv, run, fs, pnpmHome }), pnpmHome });
+			const inventory = inventoryFor ? await inventoryFor(channel)
+				: await collectInventory({ platform, arch, probes: createProbes({ platform, env: wizardEnv, run, fs, pnpmHome }), pnpmHome });
+			// Only a new release installation asks whether its release publishes the assets.
+			const assets = channel === "release" && inventory.shell?.available === false
+				? await fetchDistribution({ version: requirements.shell, base: distributionBase, ...(download ? { download } : {}) }) : null;
+			if (bundledGate({ channel, inventory, distribution: assets, version: requirements.shell })) {
+				distribution = assets;
+				const layout = prefixLayout({ platform, env: user, home });
+				return { inventory, plan: bundledPlan({ platform, distribution: assets, layout, path: pathEntryPlan(layout, { platform, env: user, home }) }) };
+			}
 			return { inventory, plan: planPreflight(inventory, { channel }) };
 		},
 		runInstall: async (request, log) => {
+			if (request?.plan?.bundled !== undefined) {
+				return runBundledInstall(request, { platform, arch, env: user, home, distribution, log,
+					...(platform === "win32" ? { registry: windowsPathRegistry(env) } : {}) });
+			}
 			const { env: wizardEnv, pnpmHome } = wizard;
 			const runnerEnv = await runnerEnvironment({ platform, env: wizardEnv, fs });
 			const ctx = { env: runnerEnv, home: runnerEnv.HOME ?? env.HOME ?? env.USERPROFILE };
@@ -202,6 +220,22 @@ async function main() {
 			log,
 		});
 		},
+	};
+}
+
+async function main() {
+	const { platform, arch, env } = process;
+	const { run, fs } = hostAdapters();
+	// The redirect file is removed once the code is redeemed, or when the host closes.
+	let redeemed = false;
+	let redirect = null;
+	const host = createInstallerServer({
+		onRedeemed: () => {
+			redeemed = true;
+			void redirect?.remove();
+		},
+		assetsDir: fileURLToPath(new URL("../assets/install-wizard/", import.meta.url)),
+		...wizardHandlers({ platform, arch, env, run, fs }),
 	});
 	let started;
 	try {

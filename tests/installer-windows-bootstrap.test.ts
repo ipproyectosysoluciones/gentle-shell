@@ -14,6 +14,7 @@ import { validateWindowsEntries, windowsShim, windowsNodeFloor, readWindowsPnpmA
 	bootstrapWindows, windowsBootstrapReason, windowsStorageEvidence } from "../scripts/installer-windows.mjs";
 import * as windowsModule from "../scripts/installer-windows.mjs";
 import * as bundled from "../scripts/bundled-install.mjs";
+import { windowsPathRegistry } from "../scripts/bundled-wizard.mjs";
 
 // Real Windows shims, verbatim (CRLF) as their generators write them. npm cmd-shim:
 // github.com/npm/cmd-shim tap-snapshots/test/basic.js.test.cjs, v4.1.0-v8.0.0 ("env
@@ -2235,7 +2236,48 @@ test("native Windows: a bundled version installs in place with the real pinned p
 		assert.equal(run.status, 0, run.stderr);
 		const output = JSON.parse(run.stdout);
 		assert.deepEqual([realpathSync.native(output.execPath).toLowerCase(), output.args], [ourNode, ["0", "a b"]]);
+		// Pi installs its packages with `npm`: setup's PATH finds the npm.cmd from the same Node archive, which runs our node.exe
+		// (its global prefix is inside the bundled prefix, so npm.cmd never switches to a user's global npm).
+		const setupEnv = bundled.setupEnvironment(layout, { platform: "win32", env, id: result.id });
+		const npm = spawnSync(cmd, ["/d", "/s", "/c", "\"npm --version\""], { cwd: layout.root, env: setupEnv, encoding: "utf8", timeout: 60000, windowsHide: true,
+			windowsVerbatimArguments: true });
+		assert.equal(npm.status, 0, npm.stderr);
+		assert.equal(npm.stdout.trim(), JSON.parse(readFileSync(join(layout.nodeDir, "node_modules", "npm", "package.json"), "utf8")).version);
+		assert.equal(existsSync(join(layout.nodeDir, "npm.cmd")), true);
 	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// The bundled install's single Windows PATH change: the HKCU user Path, edited in
+// place on this runner and restored byte for byte afterwards.
+test("native Windows: the bundled user Path entry is added once with the value kind kept, every other entry kept, and removed again", { skip: nativeUnavailable }, () => {
+	const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+	const userPath = (script: string, data: Record<string, string> = {}) => {
+		const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], { env: { ...process.env, ...data }, encoding: "utf8",
+			timeout: 60000, windowsHide: true });
+		assert.equal(result.status, 0, result.stderr);
+		return result.stdout.trim();
+	};
+	const read = () => userPath("$k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment'); if ($k.GetValueNames() -contains 'Path') { " +
+		"[string]$k.GetValueKind('Path') + '|' + [string]$k.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } else { 'absent|' }");
+	const before = read();
+	const [kind, value] = [before.slice(0, before.indexOf("|")), before.slice(before.indexOf("|") + 1)];
+	const parts = value.split(";").filter(Boolean);
+	const entry = join(realpathSync(tmpdir()), "gentle bundled path", "bin");
+	const registry = windowsPathRegistry(process.env as Record<string, string>);
+	try {
+		registry.add(entry);
+		const added = read();
+		assert.equal(added, `${kind === "absent" ? "ExpandString" : kind}|${[...parts, entry].join(";")}`);
+		// Never twice, whatever its case or trailing backslash.
+		registry.add(`${entry.toUpperCase()}\\`);
+		assert.equal(read(), added);
+		registry.remove(entry);
+		assert.equal(read(), `${kind === "absent" ? "ExpandString" : kind}|${parts.join(";")}`);
+	} finally {
+		userPath("$k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment'); if ($env:GENTLE_TEST_KIND -eq 'absent') { $k.DeleteValue('Path', $false) } " +
+			"else { $k.SetValue('Path', $env:GENTLE_TEST_VALUE, [Microsoft.Win32.RegistryValueKind]$env:GENTLE_TEST_KIND) }; $k.Close()", { GENTLE_TEST_KIND: kind, GENTLE_TEST_VALUE: value });
+	}
+	assert.equal(read(), before);
 });
 
 test("native Windows: the bundled .cmd launcher runs from a path holding spaces and & % ^ ( ! , passes the exit code, and names a missing version", { skip: nativeUnavailable }, async () => {

@@ -18,6 +18,8 @@ export const installerPaths = Object.freeze([
   "scripts/main-channel.mjs",
   "scripts/installer-windows.mjs",
   "scripts/installer-windows-artifacts.json",
+  "scripts/bundled-wizard.mjs",
+  "scripts/bundled-install.mjs",
   "scripts/bootstrap.sh",
   "scripts/bootstrap.cmd",
   "assets/install-wizard/index.html",

@@ -266,6 +266,97 @@ A failed, empty or unparseable listing makes Pi, Shell, Gentle AI and setup
 unknown, which blocks planning. A package listed in two projects is ambiguous
 and unknown.
 
+## Bundled installation
+
+A new installation can install Gentle Shell as one self-contained product
+instead: its own pinned Node.js (with the npm in the same archive), pnpm, Pi,
+and Go on Windows. The user's Node.js, npm, pnpm, Go and Pi are not used or
+changed. The building blocks are in [bundled install](bundled-install.md);
+`scripts/bundled-wizard.mjs` wires them into the wizard.
+
+### When the wizard uses it
+
+`bundledGate` decides, as a pure function, after the usual preflight. The
+bundled plan is used only when all of these hold:
+
+- The channel is `release`.
+- The target is macOS, Linux or Windows on x64 or arm64.
+- Preflight found no Gentle Shell (`shell.available === false`). An existing or
+  unknown one keeps the current path.
+- This package's own release, `v<package version>`, publishes both
+  [distribution assets](bundled-install.md#release-distribution-assets), and
+  `readDistribution` accepts them.
+
+The assets are fetched from
+`https://github.com/Gentleman-Programming/gentle-shell/releases/download/v<version>/`:
+
+- The download asks for the identity encoding.
+- It is bounded to 64 KiB for the manifest and 8 MiB for the lockfile.
+- It follows a redirect only to an https GitHub asset host.
+
+| Fetch result | Plan |
+|---|---|
+| Both assets read | Bundled |
+| 404 for either asset (v4.0.0 has none) | Standard, unchanged |
+| Network failure, or assets that do not read | Standard, unchanged |
+
+The main channel and existing installations keep the standard runner for now.
+Upgrade and migration are T2 and T3.
+
+### Plan and steps
+
+The plan has the standard plan's shape, with no tools or blockers, plus
+`bundled`. That field holds:
+
+- the exact versions and the lockfile's sha256;
+- the prefix and its `bin` folder;
+- the pinned runtimes;
+- the single PATH change, from `pathEntryPlan`.
+
+The review screen says, before consent, that the user's own tools are not used
+or changed and that their npm registry, authentication and proxy settings are
+respected.
+
+`runBundledInstall` checks that the consented plan matches the fetched assets.
+It then runs and logs these steps, in this order:
+
+| Step | What it does |
+|---|---|
+| `claim-prefix` | `claimPrefix`: `~/.gentle-shell`, or the Windows private folder. |
+| `copy-npm-settings` | Writes the filtered copy of the user's npmrc (S12) into the prefix. |
+| `install-runtime` | `ensureRuntime`: our Node with its npm, and pnpm. Go too on Windows. |
+| `install-version` | `installVersion` from the release lockfile, `--frozen-lockfile`. |
+| `activate-version` | `activateVersion`. |
+| `write-launcher` | `ensureLauncher`. |
+| `bundled-path` | `applyPathEntry`, only for a link, a profile line or the HKCU user Path. The change is planned again first; one that differs from the consented plan is not applied. |
+| `shell-setup` | `gentle-shell setup` in `setupEnvironment`: the launcher on POSIX, and our Node with the same entry on Windows. |
+
+The wizard's progress list (`expectedSteps`) follows the same order.
+
+| PATH change | Outcome |
+|---|---|
+| None, or a link into a folder already on PATH | `ready` |
+| A profile line or the user Path | `terminal-action-required` with `open-new-terminal` |
+| A profile the installer may not edit | `terminal-action-required` with `add-path-line`; the outcome screen shows the exact line to copy and the file to add it to |
+
+A failed `install-version` or `shell-setup` reports its last error line.
+
+On Windows the user Path is edited by `windowsPathRegistry`:
+
+- Windows PowerShell reads `HKCU\Environment\Path` without expanding its
+  `%VARIABLES%`, and keeps its value kind.
+- The entry is added once, compared without case or a trailing backslash.
+- A `WM_SETTINGCHANGE` broadcast lets new terminals see the change.
+
+### What this path does not change yet
+
+- Preflight still probes the user's tools, as it does today. T5 removes those probes.
+- On POSIX, gentle-pi 4.0.0's postinstall and `gentle-shell setup` run `go version`
+  from the user's PATH, which follows ours. Observed in a local run; Go is never
+  used for the POSIX release path.
+- Gentle AI's Engram step in `gentle-shell setup` runs on its own terms. On macOS
+  it ran `brew install engram`. T4 (S9) owns that.
+
 ## Standard installation runner
 
 `scripts/installer-runner.mjs` exports `runStandardInstall({ plan, consent },

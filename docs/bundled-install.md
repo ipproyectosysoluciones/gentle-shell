@@ -1,15 +1,16 @@
 # Bundled install
 
-Gentle Shell installs as one self-contained product. It carries its own pinned Node and pnpm, and Go only when a build needs it. Pi is pinned with each Gentle Shell release. The user's own `node`, `npm`, `pnpm` and `go` are never run, read or changed.
+Gentle Shell installs as one self-contained product. It carries its own pinned Node (with the npm in the same archive) and pnpm, and Go only when a build needs it. Pi is pinned with each Gentle Shell release. The user's own `node`, `npm`, `pnpm` and `go` are never run, read or changed.
 
-The building blocks live in `scripts/bundled-install.mjs`. The web installer and `gentle-shell upgrade` share them. This module is not wired into either one yet.
+The building blocks live in `scripts/bundled-install.mjs`. The web installer and `gentle-shell upgrade` share them. The web installer uses them for a new installation of the release channel ([bundled installation](install-wizard.md#bundled-installation)); `gentle-shell upgrade` does not yet.
 
 ## Layout
 
 | Path (POSIX) | Contents |
 |---|---|
 | `~/.gentle-shell/agent/` | The isolated agent home. This module never writes it. |
-| `~/.gentle-shell/runtime/node-24.21.0/bin/node` | Our Node: only the executable from the verified archive. |
+| `~/.gentle-shell/runtime/node-24.21.0/` | Our Node from the verified archive: `bin/node`, the npm bundled with it under `lib/node_modules/npm`, and our own `bin/npm` and `bin/npx` wrappers. |
+| `~/.gentle-shell/npm/{prefix,cache}/`, `~/.gentle-shell/npm/npmrc` | npm's global prefix, cache and global config. The global config file is never written. |
 | `~/.gentle-shell/runtime/pnpm-11.1.1/package/` | Our pnpm, from the verified registry tarball. |
 | `~/.gentle-shell/runtime/go/1.25.14/go/` | Our Go, only when asked (`acquireGo` layout). |
 | `~/.gentle-shell/pnpm/{store,cache,state,config}/` | Every folder pnpm writes. |
@@ -40,13 +41,13 @@ On Windows the same layout lives under a private folder. The module tries `%LOCA
 | `PNPM_HOME` | `pnpm/` |
 | `pnpm_config_store_dir`, `pnpm_config_cache_dir`, `pnpm_config_state_dir` | `pnpm/store`, `pnpm/cache`, `pnpm/state` |
 | `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` | `pnpm/config`, `pnpm/cache`, `pnpm/state`. pnpm reads its global `config.yaml` and `auth.ini` only from the config folder. |
-| `pnpm_config_npmrc_auth_file` | `pnpm/config/npmrc`, an empty file, so the user's `~/.npmrc` is never read. |
+| `pnpm_config_npmrc_auth_file` | `pnpm/config/npmrc`, read in place of the user's `~/.npmrc`. It is empty until the installer copies the user's network, registry and authentication keys into it ([User npm settings](#user-npm-settings)). |
 | `pnpm_config_pm_on_fail` | `ignore`. Its default, `download`, makes pnpm switch to the pnpm that a `packageManager` field in a `package.json` above the folder names. Observed: `pnpm --version` under such a folder printed 9.0.0 instead of 11.1.1. |
 | `pnpm_config_runtime_on_fail` | `ignore`, so a root manifest never makes pnpm download another Node. |
 | `pnpm_config_update_notifier` | `false` |
 | `TEMP`, `TMP` (Windows) | `tmp\` |
 
-Every inherited `npm_*`, `pnpm_*` (including `PNPM_HOME`), `COREPACK_*`, `NODE_OPTIONS`, `NODE_PATH` and XDG folder variable is dropped. Everything else, such as `HOME`, proxies and `SystemRoot`, is kept.
+Every inherited `npm_*`, `pnpm_*` (including `PNPM_HOME`), `COREPACK_*`, `NODE_OPTIONS`, `NODE_PATH` and XDG folder variable is dropped. The exception is a variable the prefix npmrc names as `${NAME}`, such as `NPM_TOKEN`: pnpm expands it, so it is kept. Everything else, such as `HOME`, proxies and `SystemRoot`, is kept.
 
 ## Distribution and lockfile
 
@@ -124,9 +125,52 @@ Both `build` and `verify` create their temporary prefix (`gsd-*` in the system t
 
 The release gets the same bytes that the three systems installed.
 
-## npm is not needed
+## npm for Pi
 
-pnpm 11 runs on Node alone: `bin/pnpm.mjs`, with `node-gyp` bundled in its `dist/`. gentle-pi's postinstall is `node scripts/install-gentle-ai.mjs`. So only `bin/node` (or `node.exe`) is extracted, and npm, npx and Corepack are never published.
+pnpm 11 runs on Node alone: `bin/pnpm.mjs`, with `node-gyp` bundled in its `dist/`. Pi needs npm, though. Pi 1.1.0's package manager runs `npm install <spec> --prefix <agent dir>/npm`, and `gentle-shell setup` runs `pi install npm:<package>` through Gentle AI.
+
+So `nodeRuntimeFiles` takes the npm bundled in the same verified Node archive (npm 11.19.0 for Node 24.21.0):
+
+- **POSIX.** `lib/node_modules/npm/`, plus our own `bin/npm` and `bin/npx`. These are small sh wrappers that run our `node` with npm's entry, in place of the archive's links.
+- **Windows.** `node_modules\npm\` with `npm.cmd` and `npx.cmd`. These run the `node.exe` next to them.
+- **Skipped.** Links, Corepack and every other member. A member that would leave its folder, or an archive without npm, is rejected.
+
+`ensureRuntime` runs `npm-cli.js --version` with our Node from the staging folder. It must print the version in npm's own `package.json`.
+
+## User npm settings
+
+`userNpmrc` reads the user's npm configuration: `NPM_CONFIG_USERCONFIG` (any case) when it is an absolute path, otherwise `~/.npmrc`. It reads at most 1 MiB.
+
+`filterNpmrc` keeps only these keys (S12):
+
+- `registry` and `@scope:registry`;
+- per host: `//host/:_authToken`, `_auth`, `username`, `_password`, `certfile` and `keyfile`;
+- `proxy`, `https-proxy`, `noproxy` and `no-proxy`;
+- `ca` (and `ca[]`), `cafile` and `strict-ssl`.
+
+Each kept line is copied verbatim, so `${VAR}` references stay for pnpm and npm to expand. Comments, CRLF line ends and quoted keys are handled. Every other key is dropped, and so is everything from the first `[section]` on: an ini section never applies at the top level. The frozen lockfile still pins every version and integrity hash, so these keys cannot change what is installed.
+
+`writeNpmrcAuth` writes the result to `pnpm/config/npmrc` with one rename, mode 0600. On Windows that file is inside the private folder.
+
+## Setup environment
+
+`setupEnvironment(layout, { platform, env, id })` is the environment `gentle-shell setup` runs in. Its PATH, in order:
+
+1. Our Node's folder, which holds npm on POSIX and `npm.cmd` on Windows.
+2. `versions/<id>/node_modules/.bin`, which holds the version's `pi`.
+3. The user's PATH.
+
+npm gets its settings inside the prefix:
+
+- `npm_config_userconfig` is the filtered prefix npmrc.
+- `npm_config_globalconfig`, `npm_config_prefix` and `npm_config_cache` point under `~/.gentle-shell/npm/`.
+- `npm_config_update_notifier` is `false`.
+
+The global prefix also keeps Windows' `npm.cmd` on our npm. That shim prefers an npm installed in the global prefix.
+
+Dropped: inherited npm and pnpm settings, `NODE_OPTIONS`, `NODE_PATH`, and the wizard's `GENTLE_BOOTSTRAP_*` and `GENTLE_INSTALL_*` handoff. The user's XDG folders are kept, because Pi and Gentle AI read their own configuration through them.
+
+`pnpmEnvironment` does not set npm's settings, because pnpm never runs npm. The release verification also requires its launcher environment to hold no `npm_config_prefix`.
 
 ## PATH
 
