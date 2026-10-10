@@ -22,11 +22,13 @@ On Windows the same layout lives under a private folder. The module tries `%LOCA
 
 ## Ownership rules
 
-- **Runtimes.** Each one is downloaded through `verifiedDownload` (the existing pins and hashes), written to a staging folder and run once to check its version. It is then marked with `.gentle-shell-runtime` and published with one rename. A marked runtime is reused. An unmarked folder is never replaced.
-- **Versions.** Each version is installed in `versions/.stage-*` and checked: the installed `gentle-pi` and Pi versions must match the manifest exactly. It is then marked with `.gentle-shell-version` and published with one rename. An existing marked version is reused, and any other folder is never replaced.
+- **Runtimes.** Each one is downloaded through `verifiedDownload` (the existing pins and hashes), written to a staging folder and run once to check its version. It is then marked with `.gentle-shell-runtime` and published with one rename. A marked runtime is reused. An unmarked folder is never replaced. Renaming is safe here because the extracted trees hold only regular files and folders, never links. The pnpm tarball's executable bits (`bin/pnpm.mjs`, `dist/node-gyp-bin/node-gyp`) are kept, for the owner only.
+- **Versions.** Each version is installed in place, in its final `versions/<shell>-<pi>/` folder, and that folder is never renamed afterwards. On Windows, when symlinks are not allowed, pnpm links packages with junctions to absolute paths, so a renamed folder would leave every link dangling. The folder is claimed with `mkdir`, and its `.gentle-shell-version` marker first reads `installing <id> <pid>`. After pnpm runs, the installed `gentle-pi` and Pi versions must match the manifest exactly. Only then is the marker replaced, with one rename, by `<id>`. Only that final marker makes the version valid.
+- **Interrupted installs.** A folder whose marker is `installing <id> <pid>` for this id, and whose process is gone, is removed and installed again. A live process stops the install. Anything else at that path is never replaced. A failed install removes the folder it claimed.
+- **Go on Windows.** `installVersion` refuses to run on Windows without the pinned Go under `runtime/go`. gentle-pi's postinstall builds Gentle AI with the first `go.exe` on PATH, which must never be the user's.
 - **`current`.** Only our own symlink or pointer file is switched. Anything else at that path stops the switch.
-- **Pruning.** `pruneVersions(layout, 2)` keeps the active version and the most recently activated other one. It never deletes the active version or a folder without our marker.
-- **Launcher.** Only a launcher that carries our generated marker line is refreshed. Any other file there is never replaced.
+- **Pruning.** `pruneVersions(layout, 2)` keeps the active version and the most recently activated other one. It deletes nothing unless `current` names an installed version. It never deletes the active version, an unfinished install, or a folder without our marker.
+- **Launcher.** Only a launcher that carries our generated marker line is refreshed. Any other file there is never replaced. The launcher passes every argument and the exit code through. When no active version exists, it prints `gentle-shell: no active Gentle Shell version; run the Gentle Shell installer again.` and exits 1. The Windows `.cmd` runs with delayed expansion off, so `!`, `%`, `^`, `&`, `(` and `,` in the prefix path stay literal.
 
 ## pnpm environment
 
@@ -39,7 +41,8 @@ On Windows the same layout lives under a private folder. The module tries `%LOCA
 | `pnpm_config_store_dir`, `pnpm_config_cache_dir`, `pnpm_config_state_dir` | `pnpm/store`, `pnpm/cache`, `pnpm/state` |
 | `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` | `pnpm/config`, `pnpm/cache`, `pnpm/state`. pnpm reads its global `config.yaml` and `auth.ini` only from the config folder. |
 | `pnpm_config_npmrc_auth_file` | `pnpm/config/npmrc`, an empty file, so the user's `~/.npmrc` is never read. |
-| `pnpm_config_manage_package_manager_versions` | `false` |
+| `pnpm_config_pm_on_fail` | `ignore`. Its default, `download`, makes pnpm switch to the pnpm that a `packageManager` field in a `package.json` above the folder names. Observed: `pnpm --version` under such a folder printed 9.0.0 instead of 11.1.1. |
+| `pnpm_config_runtime_on_fail` | `ignore`, so a root manifest never makes pnpm download another Node. |
 | `pnpm_config_update_notifier` | `false` |
 | `TEMP`, `TMP` (Windows) | `tmp\` |
 
@@ -58,7 +61,9 @@ These settings mean:
 - **Other build scripts are skipped, not fatal.** Pi's tree has build scripts (`@google/genai`, `koffi`, `protobufjs`), and pnpm 11 fails on ignored builds by default.
 - **The parent folders are ignored.** The workspace file also stops pnpm's upward search, so a `pnpm-workspace.yaml` or `.npmrc` in a parent folder never applies.
 
-`installVersion` then runs `node pnpm.mjs install --frozen-lockfile` in the staging folder.
+`installVersion` then runs `node pnpm.mjs install --frozen-lockfile` in the version folder.
+
+After an install that skips build scripts, pnpm 11 rewrites `pnpm-workspace.yaml` in place. It adds each skipped package under `allowBuilds` with the placeholder value `set this to true or false`. The release lockfile (T1b) must therefore be resolved from the unmodified `distributionFiles()` output. It must never come from a `pnpm-workspace.yaml` read back from a folder pnpm already installed into.
 
 ## npm is not needed
 
@@ -69,14 +74,20 @@ pnpm 11 runs on Node alone: `bin/pnpm.mjs`, with `node-gyp` bundled in its `dist
 `pathEntryPlan` returns the single PATH change and does not apply it:
 
 - **Symlink.** If `~/.local/bin` is on PATH, the plan is a `~/.local/bin/gentle-shell` symlink, when that name is free.
-- **Profile line.** Otherwise the plan is one line ending in `# gentle-shell bundled install`, added to the detected profile:
-  - `.zshrc` for zsh;
-  - `.bash_profile` (macOS) or `.bashrc` for bash;
-  - `conf.d/gentle-shell.fish` for fish;
-  - `.profile` otherwise.
+- **Profile line.** Otherwise the plan is one line ending in `# gentle-shell bundled install`, added to the file the user's shell reads:
+  - `$ZDOTDIR/.zshrc` (or `~/.zshrc`) for zsh.
+  - For bash on macOS, where terminals start login shells: the first of `~/.bash_profile`, `~/.bash_login` and `~/.profile` that exists. Login bash reads exactly one of them, in that order (`INVOCATION` in bash(1)). `~/.bash_profile` is created only when none exists, because creating it would hide the user's `~/.profile`.
+  - For bash elsewhere: `~/.bashrc`, which interactive non-login shells (Linux terminals) read. Distributions' `~/.profile` sources it for login shells.
+  - Our own `conf.d/gentle-shell.fish` for fish.
+  - `~/.profile` otherwise.
+- **Manual.** The installer edits that file only when it is a regular file this user can write and every folder above it under home is real. It may also create the file when it is absent and its folders are real and writable. A symlinked profile (stow, chezmoi, home-manager), a read-only one, anything that is not a file, or a file reached through a linked folder gets a `manual` plan instead. That plan carries the exact line to add, and nothing is written. When the file, even through a link, already holds the line, the plan is `none`, so the user is not asked twice.
 - **Registry (Windows).** The plan is the `bin` entry in the HKCU user `Path`.
 
-`applyPathEntry` and `removePathEntry` apply and revert only that change. The registry change goes through an injected adapter. `pnpm setup` is not used.
+`applyPathEntry` applies only that change and returns a receipt. The receipt records whether a newline was added before our line and whether the file was created. `removePathEntry(receipt)` uses it to restore the file byte for byte, and deletes a file it created once nothing else is left in it. Self-uninstall (T6) must keep that receipt.
+
+- **Safe appends.** The line goes in with `O_NOFOLLOW`. A profile that turned into a link after planning is refused.
+- **Registry.** The registry change goes through an injected adapter.
+- **No `pnpm setup`.** It is not used.
 
 ## Never touched
 

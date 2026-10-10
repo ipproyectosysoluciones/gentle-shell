@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -26,10 +27,10 @@ function claimed(platform = "darwin") {
 }
 
 // A ustar member, as the Node and pnpm tarballs carry them.
-function tarEntry(name: string, { type = "0", data = Buffer.alloc(0), link = "" } = {}) {
+function tarEntry(name: string, { type = "0", data = Buffer.alloc(0), link = "", mode = "0000644" } = {}) {
 	const header = Buffer.alloc(512);
 	header.write(name, 0, 100, "utf8");
-	header.write("0000755\0", 100);
+	header.write(`${mode}\0`, 100);
 	header.write("0000000\0", 108);
 	header.write("0000000\0", 116);
 	header.write(`${data.length.toString(8).padStart(11, "0")}\0`, 124);
@@ -80,7 +81,9 @@ const nodeArchive = tarGz([
 ]);
 const pnpmArchive = tarGz([
 	tarEntry("package/package.json", { data: Buffer.from(JSON.stringify({ name: "pnpm", version: PNPM, engines: { node: ">=22.13" }, bin: { pnpm: "bin/pnpm.mjs" } })) }),
-	tarEntry("package/bin/pnpm.mjs", { data: Buffer.from("// fixture pnpm\n") }),
+	tarEntry("package/bin/pnpm.mjs", { data: Buffer.from("// fixture pnpm\n"), mode: "0000755" }),
+	// pnpm runs node-gyp from this folder: it must stay executable.
+	tarEntry("package/dist/node-gyp-bin/node-gyp", { data: Buffer.from("#!/bin/sh\n"), mode: "0000755" }),
 ]);
 const archives: Record<string, Buffer> = { node: nodeArchive, pnpm: pnpmArchive };
 const sha256 = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
@@ -214,6 +217,10 @@ posixTest("ensureRuntime installs the verified Node and pnpm into runtime/ and r
 	assert.deepEqual(readFileSync(layout.node), nodeBytes);
 	assert.equal(lstatSync(layout.node).mode & 0o777, 0o700);
 	assert.equal(readFileSync(layout.pnpm, "utf8"), "// fixture pnpm\n");
+	// The executable bits the pnpm tarball declares are kept, for the owner only.
+	assert.equal(lstatSync(layout.pnpm).mode & 0o777, 0o700);
+	assert.equal(lstatSync(join(layout.pnpmDir, "package", "dist", "node-gyp-bin", "node-gyp")).mode & 0o777, 0o700);
+	assert.equal(lstatSync(join(layout.pnpmDir, "package", "package.json")).mode & 0o777, 0o600);
 	// Only the Node executable is published: no npm, no links.
 	assert.deepEqual(readdirSync(join(layout.runtime, `node-${NODE}`)).sort(), [".gentle-shell-runtime", "bin"]);
 	assert.deepEqual(readdirSync(join(layout.runtime, `node-${NODE}`, "bin")), ["node"]);
@@ -287,7 +294,11 @@ test("pnpmEnvironment keeps pnpm's home, store, cache, state and config inside t
 	assert.equal(env.XDG_CONFIG_HOME, `${root}/pnpm/config`);
 	assert.equal(env.XDG_CACHE_HOME, `${root}/pnpm/cache`);
 	assert.equal(env.XDG_STATE_HOME, `${root}/pnpm/state`);
-	assert.equal(env.pnpm_config_manage_package_manager_versions, "false");
+	// pnpm 11 has no manage-package-manager-versions setting; pm-on-fail defaults to
+	// "download", which switches to the pnpm a package.json above the folder names.
+	assert.equal(env.pnpm_config_manage_package_manager_versions, undefined);
+	assert.equal(env.pnpm_config_pm_on_fail, "ignore");
+	assert.equal(env.pnpm_config_runtime_on_fail, "ignore");
 	assert.equal(env.pnpm_config_update_notifier, "false");
 	for (const key of ["npm_config_registry", "NPM_CONFIG_USERCONFIG", "NODE_OPTIONS", "npm_lifecycle_event", "COREPACK_ENABLE_STRICT"]) assert.equal(env[key], undefined, key);
 	assert.equal(env.HTTPS_PROXY, "http://proxy:3128");
@@ -312,21 +323,24 @@ test("pnpmEnvironment on Windows replaces every Path spelling and moves TEMP int
 // Rule 4: one frozen install per version, verified, never replacing a folder.
 const manifest = { shell: "4.1.0", pi: "1.0.2" };
 function fakePnpm(versions = manifest) {
-	const runs: { command: string; args: string[]; cwd: string; env: Record<string, string> }[] = [];
+	const runs: { command: string; args: string[]; cwd: string; env: Record<string, string>; marker: string }[] = [];
 	const run = (command: string, args: string[], options: { cwd: string; env: Record<string, string> }) => {
-		runs.push({ command, args, ...options });
+		runs.push({ command, args, ...options, marker: readFileSync(join(options.cwd, ".gentle-shell-version"), "utf8") });
 		const modules = join(options.cwd, "node_modules");
-		mkdirSync(join(modules, "gentle-pi", "bin"), { recursive: true });
+		// Like pnpm's Windows junctions: absolute links into node_modules/.pnpm.
+		const real = join(modules, ".pnpm", `gentle-pi@${versions.shell}`, "node_modules", "gentle-pi");
+		mkdirSync(join(real, "bin"), { recursive: true });
 		mkdirSync(join(modules, "@earendil-works", "pi-coding-agent"), { recursive: true });
-		writeFileSync(join(modules, "gentle-pi", "package.json"), JSON.stringify({ name: "gentle-pi", version: versions.shell }));
-		writeFileSync(join(modules, "gentle-pi", "bin", "gentle-shell.mjs"), "");
+		writeFileSync(join(real, "package.json"), JSON.stringify({ name: "gentle-pi", version: versions.shell }));
+		writeFileSync(join(real, "bin", "gentle-shell.mjs"), "");
+		symlinkSync(real, join(modules, "gentle-pi"));
 		writeFileSync(join(modules, "@earendil-works", "pi-coding-agent", "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: versions.pi }));
 		return { status: 0, stdout: "", stderr: "" };
 	};
 	return { runs, run };
 }
 
-posixTest("installVersion runs our pnpm frozen in a staging folder and publishes versions/<shell>-<pi>", async () => {
+posixTest("installVersion runs our pnpm frozen in the final versions/<shell>-<pi> folder and marks it valid last", async () => {
 	const { layout } = claimed();
 	const pnpm = fakePnpm();
 	const result = await installVersion({ layout, manifest, lockfile: "lockfileVersion: '9.0'\n", platform: "darwin", env: { PATH: "/usr/bin" }, adapters: { run: pnpm.run } });
@@ -335,8 +349,11 @@ posixTest("installVersion runs our pnpm frozen in a staging folder and publishes
 	const [install] = pnpm.runs;
 	assert.equal(install.command, layout.node);
 	assert.deepEqual(install.args, [layout.pnpm, "install", "--frozen-lockfile"]);
-	assert.equal(posix.dirname(install.cwd), layout.versions);
-	assert.match(posix.basename(install.cwd), /^\.stage-/);
+	// pnpm runs where the version stays: its absolute links (Windows junctions) never dangle.
+	assert.equal(install.cwd, result.path);
+	assert.equal(install.marker, `installing 4.1.0-1.0.2 ${process.pid}\n`);
+	assert.equal(readFileSync(join(result.path, ".gentle-shell-version"), "utf8"), "4.1.0-1.0.2\n");
+	assert.equal(realpathSync(join(result.path, "node_modules", "gentle-pi")).startsWith(`${realpathSync(result.path)}/`), true);
 	assert.equal(install.env.pnpm_config_store_dir, layout.store);
 	const files = distributionFiles(manifest);
 	assert.deepEqual(JSON.parse(files["package.json"]).dependencies, { "gentle-pi": "4.1.0", "@earendil-works/pi-coding-agent": "1.0.2" });
@@ -359,6 +376,47 @@ posixTest("installVersion rejects a wrong installed version, a foreign folder an
 	await assert.rejects(installVersion({ layout, manifest, lockfile: "x", platform: "darwin", env: {}, adapters: { run: fakePnpm().run } }), /Conflicting version/);
 	assert.equal(readFileSync(join(layout.versions, "4.1.0-1.0.2", "user.txt"), "utf8"), "keep");
 	await assert.rejects(installVersion({ layout, manifest: { shell: "../x", pi: "1.0.2" }, lockfile: "x", platform: "darwin", env: {}, adapters: { run: fakePnpm().run } }), /version/i);
+	// A folder whose marker names another version is not ours either.
+	writeFileSync(join(layout.versions, "4.1.0-1.0.2", ".gentle-shell-version"), "installing 9.9.9-1.0.0 1\n");
+	await assert.rejects(installVersion({ layout, manifest, lockfile: "x", platform: "darwin", env: {}, adapters: { run: fakePnpm().run } }), /Conflicting version/);
+	assert.equal(readFileSync(join(layout.versions, "4.1.0-1.0.2", "user.txt"), "utf8"), "keep");
+});
+
+posixTest("installVersion cleans only its own interrupted install and never one still running", async () => {
+	const { layout } = claimed();
+	const folder = join(layout.versions, "4.1.0-1.0.2");
+	const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+	mkdirSync(join(folder, "node_modules"), { recursive: true });
+	writeFileSync(join(folder, ".gentle-shell-version"), `installing 4.1.0-1.0.2 ${dead}\n`);
+	writeFileSync(join(folder, "node_modules", "partial"), "crash leftover");
+	const result = await installVersion({ layout, manifest, lockfile: "x", platform: "darwin", env: {}, adapters: { run: fakePnpm().run } });
+	assert.equal(result.installed, true);
+	assert.equal(existsSync(join(folder, "node_modules", "partial")), false);
+	assert.equal(readFileSync(join(folder, ".gentle-shell-version"), "utf8"), "4.1.0-1.0.2\n");
+	const other = claimed().layout;
+	const running = join(other.versions, "4.1.0-1.0.2");
+	mkdirSync(running);
+	writeFileSync(join(running, ".gentle-shell-version"), `installing 4.1.0-1.0.2 ${process.pid}\n`);
+	await assert.rejects(installVersion({ layout: other, manifest, lockfile: "x", platform: "darwin", env: {}, adapters: { run: fakePnpm().run } }), /in progress/);
+	assert.equal(readFileSync(join(running, ".gentle-shell-version"), "utf8"), `installing 4.1.0-1.0.2 ${process.pid}\n`);
+	// pruneVersions never counts or deletes an unfinished version.
+	assert.deepEqual(pruneVersions(other), []);
+	assert.equal(existsSync(running), true);
+});
+
+posixTest("installVersion for Windows refuses to run without the pinned Go, so a build never finds the user's go.exe", async () => {
+	const { layout } = claimed();
+	const pnpm = fakePnpm();
+	for (const go of [null, "/usr/local/go/bin/go", join(layout.goRoot, "1.25.14", "go", "bin", "go.exe")]) {
+		await assert.rejects(installVersion({ layout, manifest, lockfile: "x", platform: "win32", env: {}, go, adapters: { run: pnpm.run } }), /pinned Go/);
+	}
+	assert.equal(pnpm.runs.length, 0);
+	assert.deepEqual(readdirSync(layout.versions), []);
+	const go = join(layout.goRoot, "1.25.14", "go", "bin", "go.exe");
+	mkdirSync(posix.dirname(go), { recursive: true });
+	writeFileSync(go, "");
+	await installVersion({ layout, manifest, lockfile: "x", platform: "win32", env: {}, go, adapters: { run: pnpm.run } });
+	assert.equal(pnpm.runs[0].env.Path.split(";")[1], posix.dirname(go));
 });
 
 // Rule 5: atomic switch, keep two.
@@ -382,6 +440,17 @@ posixTest("activateVersion swaps the current symlink atomically and pruneVersion
 	assert.throws(() => activateVersion(layout, "../x"), /version/i);
 });
 
+posixTest("pruneVersions deletes nothing while current names a version that is not installed", async () => {
+	const { layout } = claimed();
+	await installed(layout, [["4.0.0", "1.0.0"], ["4.1.0", "1.0.1"], ["4.2.0", "1.0.2"]]);
+	for (const id of ["4.0.0-1.0.0", "4.1.0-1.0.1"]) activateVersion(layout, id);
+	symlinkSync("versions/4.9.0-1.0.9", `${layout.current}.next`);
+	renameSync(`${layout.current}.next`, layout.current);
+	assert.equal(activeVersion(layout), "4.9.0-1.0.9");
+	assert.deepEqual(pruneVersions(layout), []);
+	assert.deepEqual(readdirSync(layout.versions).sort(), ["4.0.0-1.0.0", "4.1.0-1.0.1", "4.2.0-1.0.2"]);
+});
+
 posixTest("activateVersion never replaces a current that is not ours and writes a pointer file on Windows layouts", async () => {
 	const { layout } = claimed();
 	await installed(layout, [["4.0.0", "1.0.0"]]);
@@ -403,8 +472,21 @@ posixTest("ensureLauncher writes bin/gentle-shell that execs our Node with the c
 	ensureLauncher(layout);
 	const text = readFileSync(layout.launcher, "utf8");
 	const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-	assert.equal(text, `#!/bin/sh\n# gentle-shell bundled launcher (generated; do not edit)\nexec ${quote(layout.node)} ${quote(join(layout.current, "node_modules/gentle-pi/bin/gentle-shell.mjs"))} "$@"\n`);
+	const entry = join(layout.current, "node_modules/gentle-pi/bin/gentle-shell.mjs");
+	assert.equal(text, ["#!/bin/sh", "# gentle-shell bundled launcher (generated; do not edit)", `if [ ! -f ${quote(entry)} ]; then`,
+		"\techo 'gentle-shell: no active Gentle Shell version; run the Gentle Shell installer again.' >&2", "\texit 1", "fi",
+		`exec ${quote(layout.node)} ${quote(entry)} "$@"`, ""].join("\n"));
 	assert.equal(lstatSync(layout.launcher).mode & 0o777, 0o755);
+	// Without an active version it says so; with one it passes every argument and the exit code.
+	const missing = spawnSync(layout.launcher, ["x"], { encoding: "utf8" });
+	assert.deepEqual([missing.status, missing.stderr], [1, "gentle-shell: no active Gentle Shell version; run the Gentle Shell installer again.\n"]);
+	mkdirSync(posix.dirname(layout.node), { recursive: true });
+	writeFileSync(layout.node, "#!/bin/sh\nprintf '%s|' \"$@\"\nexit 7\n", { mode: 0o700 });
+	mkdirSync(join(layout.versions, "v", "node_modules/gentle-pi/bin"), { recursive: true });
+	writeFileSync(join(layout.versions, "v", "node_modules/gentle-pi/bin/gentle-shell.mjs"), "");
+	symlinkSync("versions/v", layout.current);
+	const ran = spawnSync(layout.launcher, ["a b", "$HOME", "'"], { encoding: "utf8" });
+	assert.deepEqual([ran.status, ran.stdout], [7, `${entry}|a b|$HOME|'|`]);
 	ensureLauncher(layout);
 	writeFileSync(layout.launcher, "#!/bin/sh\necho user\n");
 	assert.throws(() => ensureLauncher(layout), /Conflicting launcher/);
@@ -413,10 +495,12 @@ posixTest("ensureLauncher writes bin/gentle-shell that execs our Node with the c
 test("ensureLauncher text for Windows reads the current pointer file", async () => {
 	const { launcherText } = await import("../scripts/bundled-install.mjs");
 	const layout = prefixLayout({ platform: "win32", env: { LOCALAPPDATA: "C:\\L", USERPROFILE: "C:\\U" }, home: "C:\\U" });
-	assert.equal(launcherText(layout), ["@echo off", "rem gentle-shell bundled launcher (generated; do not edit)", "setlocal",
-		'set /p GENTLE_SHELL_CURRENT=<"%~dp0..\\current"',
-		`"%~dp0..\\runtime\\node-${NODE}\\node.exe" "%~dp0..\\versions\\%GENTLE_SHELL_CURRENT%\\node_modules\\gentle-pi\\bin\\gentle-shell.mjs" %*`,
-		"exit /b %errorlevel%", ""].join("\r\n"));
+	const entry = "%~dp0..\\versions\\%GENTLE_SHELL_CURRENT%\\node_modules\\gentle-pi\\bin\\gentle-shell.mjs";
+	assert.equal(launcherText(layout), ["@echo off", "rem gentle-shell bundled launcher (generated; do not edit)", "setlocal DisableDelayedExpansion",
+		'set "GENTLE_SHELL_CURRENT="', 'if exist "%~dp0..\\current" set /p GENTLE_SHELL_CURRENT=<"%~dp0..\\current"',
+		"if not defined GENTLE_SHELL_CURRENT goto missing", `if not exist "${entry}" goto missing`,
+		`"%~dp0..\\runtime\\node-${NODE}\\node.exe" "${entry}" %*`, "exit /b %errorlevel%", ":missing",
+		">&2 echo gentle-shell: no active Gentle Shell version; run the Gentle Shell installer again.", "exit /b 1", ""].join("\r\n"));
 });
 
 posixTest("pathEntryPlan links into ~/.local/bin on PATH, otherwise plans one marked profile line, and both are reversible", () => {
@@ -435,18 +519,119 @@ posixTest("pathEntryPlan links into ~/.local/bin on PATH, otherwise plans one ma
 	const zshrc = join(user, ".zshrc");
 	writeFileSync(zshrc, "alias ll='ls -l'\n");
 	const profile = pathEntryPlan(layout, { platform: "darwin", env: { PATH: "/usr/bin", SHELL: "/bin/zsh" }, home: user });
-	assert.deepEqual(profile, { kind: "profile", path: zshrc, line: `export PATH="${layout.bin}:$PATH" # gentle-shell bundled install` });
-	applyPathEntry(profile);
+	assert.deepEqual(profile, { kind: "profile", path: zshrc, line: `export PATH="${layout.bin}:$PATH" # gentle-shell bundled install`, create: false });
+	const applied = applyPathEntry(profile);
 	assert.equal(readFileSync(zshrc, "utf8"), `alias ll='ls -l'\n${profile.line}\n`);
 	assert.deepEqual(pathEntryPlan(layout, { platform: "darwin", env: { PATH: "/usr/bin", SHELL: "/bin/zsh" }, home: user }), { kind: "none" });
-	removePathEntry(profile);
+	removePathEntry(applied);
 	assert.equal(readFileSync(zshrc, "utf8"), "alias ll='ls -l'\n");
 	assert.equal(pathEntryPlan(layout, { platform: "linux", env: { PATH: "/usr/bin", SHELL: "/bin/bash" }, home: user }).path, join(user, ".bashrc"));
 	assert.equal(pathEntryPlan(layout, { platform: "linux", env: { PATH: "/usr/bin" }, home: user }).path, join(user, ".profile"));
+	assert.equal(pathEntryPlan(layout, { platform: "linux", env: { PATH: "/usr/bin", SHELL: "/bin/zsh", ZDOTDIR: join(user, "zdot") }, home: user }).path, join(user, "zdot", ".zshrc"));
 	assert.deepEqual(pathEntryPlan(layout, { platform: "linux", env: { PATH: `/usr/bin:${layout.bin}` }, home: user }), { kind: "none" });
 	// Someone else's gentle-shell in ~/.local/bin is never replaced.
 	writeFileSync(join(localBin, "gentle-shell"), "user");
 	assert.equal(pathEntryPlan(layout, { platform: "linux", env: { PATH: localBin, SHELL: "/bin/bash" }, home: user }).kind, "profile");
+});
+
+posixTest("pathEntryPlan never writes through a symlinked, read-only or non-file profile and asks for one manual line instead", () => {
+	const { home: user, layout } = claimed();
+	const env = { PATH: "/usr/bin", SHELL: "/bin/zsh" };
+	const line = `export PATH="${layout.bin}:$PATH" # gentle-shell bundled install`;
+	// stow/chezmoi: the profile is a link into a dotfiles repository.
+	const dotfiles = join(posix.dirname(user), "dotfiles");
+	mkdirSync(dotfiles);
+	writeFileSync(join(dotfiles, "zshrc"), "alias x=y");
+	symlinkSync(join(dotfiles, "zshrc"), join(user, ".zshrc"));
+	const manual = pathEntryPlan(layout, { platform: "darwin", env, home: user });
+	assert.deepEqual(manual, { kind: "manual", path: join(user, ".zshrc"), line, reason: "symlink" });
+	applyPathEntry(manual);
+	removePathEntry(manual);
+	assert.equal(readFileSync(join(dotfiles, "zshrc"), "utf8"), "alias x=y");
+	// Once the user added the line, nothing is asked again.
+	writeFileSync(join(dotfiles, "zshrc"), `alias x=y\n${line}\n`);
+	assert.deepEqual(pathEntryPlan(layout, { platform: "darwin", env, home: user }), { kind: "none" });
+	// home-manager: a read-only file; a folder where the profile should be.
+	const readOnly = claimed();
+	writeFileSync(join(readOnly.home, ".zshrc"), "alias x=y\n");
+	chmodSync(join(readOnly.home, ".zshrc"), 0o444);
+	assert.equal(pathEntryPlan(readOnly.layout, { platform: "darwin", env, home: readOnly.home }).kind, "manual");
+	const folder = claimed();
+	mkdirSync(join(folder.home, ".zshrc"));
+	assert.equal(pathEntryPlan(folder.layout, { platform: "darwin", env, home: folder.home }).kind, "manual");
+	// A fish conf.d reached through a linked ~/.config is not created through the link.
+	const fish = claimed();
+	mkdirSync(join(dotfiles, "config", "fish", "conf.d"), { recursive: true });
+	symlinkSync(join(dotfiles, "config"), join(fish.home, ".config"));
+	const fishPlan = pathEntryPlan(fish.layout, { platform: "linux", env: { PATH: "/usr/bin", SHELL: "/usr/bin/fish" }, home: fish.home });
+	assert.equal(fishPlan.kind, "manual");
+	assert.deepEqual(readdirSync(join(dotfiles, "config", "fish", "conf.d")), []);
+});
+
+posixTest("applyPathEntry adds one line after a profile without a final newline, never twice, and removePathEntry restores it exactly", () => {
+	const { home: user, layout } = claimed();
+	const env = { PATH: "/usr/bin", SHELL: "/bin/zsh" };
+	const zshrc = join(user, ".zshrc");
+	writeFileSync(zshrc, "alias x=y");
+	chmodSync(zshrc, 0o640);
+	const plan = pathEntryPlan(layout, { platform: "darwin", env, home: user });
+	const applied = applyPathEntry(plan);
+	assert.equal(readFileSync(zshrc, "utf8"), `alias x=y\n${plan.line}\n`);
+	assert.deepEqual(applyPathEntry(plan), { ...plan, applied: false });
+	assert.equal(readFileSync(zshrc, "utf8"), `alias x=y\n${plan.line}\n`);
+	removePathEntry(applied);
+	assert.equal(readFileSync(zshrc, "utf8"), "alias x=y");
+	assert.equal(lstatSync(zshrc).mode & 0o777, 0o640);
+	// A profile that turned into a link after planning is never written.
+	writeFileSync(join(user, "elsewhere"), "keep");
+	const again = pathEntryPlan(layout, { platform: "darwin", env, home: user });
+	renameSync(zshrc, join(user, "zshrc.old"));
+	symlinkSync(join(user, "elsewhere"), zshrc);
+	assert.throws(() => applyPathEntry(again), /changed/);
+	assert.equal(readFileSync(join(user, "elsewhere"), "utf8"), "keep");
+});
+
+posixTest("pathEntryPlan for bash writes the first file login bash reads and creates ~/.bash_profile only when none exists", () => {
+	const bash = (files: string[], platform = "darwin") => {
+		const { home: user, layout } = claimed();
+		for (const file of files) writeFileSync(join(user, file), "export FROM=user\n");
+		return { user, layout, plan: pathEntryPlan(layout, { platform, env: { PATH: "/usr/bin", SHELL: "/bin/bash" }, home: user }) };
+	};
+	for (const [files, wanted] of [[[".profile"], ".profile"], [[".bash_login", ".profile"], ".bash_login"], [[".bash_profile", ".bash_login", ".profile"], ".bash_profile"]] as [string[], string][]) {
+		const { user, plan } = bash(files);
+		assert.deepEqual([plan.kind, plan.path, plan.create], ["profile", join(user, wanted), false], wanted);
+	}
+	// None: ~/.bash_profile is created, and removed again only while it holds nothing else.
+	const fresh = bash([]);
+	assert.deepEqual([fresh.plan.path, fresh.plan.create], [join(fresh.user, ".bash_profile"), true]);
+	removePathEntry(applyPathEntry(fresh.plan));
+	assert.equal(existsSync(join(fresh.user, ".bash_profile")), false);
+	const kept = bash([]);
+	const receipt = applyPathEntry(kept.plan);
+	writeFileSync(join(kept.user, ".bash_profile"), "alias l=ls\n", { flag: "a" });
+	removePathEntry(receipt);
+	assert.equal(readFileSync(join(kept.user, ".bash_profile"), "utf8"), "alias l=ls\n");
+	// Interactive non-login bash, what Linux terminals start, reads ~/.bashrc.
+	const linux = bash([".profile"], "linux");
+	assert.deepEqual([linux.plan.path, linux.plan.create], [join(linux.user, ".bashrc"), true]);
+});
+
+test("a login bash still reads the user's ~/.profile after the PATH line is added and removed", { skip: posixHost || (existsSync("/bin/bash") ? false : "no /bin/bash") }, () => {
+	const { home: user, layout } = claimed();
+	writeFileSync(join(user, ".profile"), "export FROM=profile\n");
+	const login = () => {
+		const out = spawnSync("/bin/bash", ["-l", "-c", "echo \"[$FROM] $PATH\""], { env: { HOME: user, PATH: "/usr/bin:/bin", SHELL: "/bin/bash" }, encoding: "utf8" }).stdout.trim();
+		return [out.slice(0, out.indexOf(" ")), out.slice(out.indexOf(" ") + 1)];
+	};
+	const plan = pathEntryPlan(layout, { platform: "darwin", env: { PATH: "/usr/bin:/bin", SHELL: "/bin/bash" }, home: user });
+	const receipt = applyPathEntry(plan);
+	// macOS's /etc/profile reorders PATH (path_helper): only the pieces are checked.
+	const [from, path] = login();
+	assert.deepEqual([from, path.split(":").includes(layout.bin)], ["[profile]", true]);
+	removePathEntry(receipt);
+	const [after, restored] = login();
+	assert.deepEqual([after, restored.split(":").includes(layout.bin)], ["[profile]", false]);
+	assert.deepEqual(readdirSync(user).filter((name) => name.startsWith(".bash")), []);
 });
 
 test("pathEntryPlan on Windows plans one HKCU Path entry applied through an injected adapter", () => {
