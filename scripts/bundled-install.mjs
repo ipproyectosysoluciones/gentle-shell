@@ -4,7 +4,7 @@
 // entry. The user's node, npm, pnpm and go are never run, read or changed.
 // Shared by the web installer and `gentle-shell upgrade`; every effect outside
 // plain path arithmetic goes through an injectable adapter for tests.
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { accessSync, chmodSync, closeSync, constants, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync,
 	rmSync, symlinkSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { posix, win32 } from "node:path";
@@ -229,7 +229,7 @@ function zipMember(bytes, wanted) {
 }
 
 /** Runs a command without a shell; resolves { status, stdout, stderr }. */
-function runCommand(command, args, { cwd, env, timeout = 15000 }) {
+export function runCommand(command, args, { cwd, env, timeout = 15000 }) {
 	return new Promise((resolve) => {
 		const child = spawn(command, args, { cwd, env, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
 		const output = { stdout: "", stderr: "" };
@@ -357,6 +357,45 @@ export function distributionFiles(manifest) {
 	const project = { name: "gentle-shell-distribution", version: shell, private: true, dependencies: { "gentle-pi": shell, "@earendil-works/pi-coding-agent": pi } };
 	return { "package.json": `${JSON.stringify(project, null, "\t")}\n`, "pnpm-workspace.yaml": "allowBuilds:\n  gentle-pi: true\nstrictDepBuilds: false\n" };
 }
+
+/** The two release assets (T1b), under stable names. */
+export const DISTRIBUTION_ASSETS = Object.freeze({ distribution: "gentle-shell-distribution.json", lockfile: "gentle-shell-distribution-lock.yaml" });
+const DISTRIBUTION_SCHEMA = 1;
+const sha256 = (text) => createHash("sha256").update(text, "utf8").digest("hex");
+/** The distribution asset text: the exact versions, the pinned Node and pnpm
+ * the lockfile was resolved with, the files installVersion writes next to it
+ * and the lockfile's sha256. Plain data in a fixed order, so the same inputs
+ * always give the same bytes.
+ */
+export function distributionAsset(manifest, lockfile) {
+	const { shell, pi, id } = versionsOf(manifest);
+	if (typeof lockfile !== "string" || lockfile.length === 0) throw new Error("Release lockfile missing");
+	const asset = { schema: DISTRIBUTION_SCHEMA, shell, pi, id, generatedWith: { node: pins.node, pnpm: pins.pnpm }, files: distributionFiles({ shell, pi }),
+		lockfile: { name: DISTRIBUTION_ASSETS.lockfile, sha256: sha256(lockfile) } };
+	return `${JSON.stringify(asset, null, "\t")}\n`;
+}
+/** Reads a downloaded asset pair: returns { manifest, lockfile } only for exact
+ * versions, a lockfile whose sha256 the asset records, and workspace files equal
+ * to the ones this module's installVersion writes (a frozen install with other
+ * settings was never verified). generatedWith is recorded, not compared.
+ */
+export function readDistribution(text, lockfile) {
+	let asset;
+	try { asset = JSON.parse(text); }
+	catch { throw new Error("Distribution asset rejected"); }
+	if (asset?.schema !== DISTRIBUTION_SCHEMA) throw new Error("Distribution asset schema rejected");
+	const manifest = { shell: asset.shell, pi: asset.pi };
+	const { id } = versionsOf(manifest);
+	const files = distributionFiles(manifest);
+	const recorded = asset.files ?? {};
+	if (asset.id !== id || Object.keys(recorded).length !== Object.keys(files).length || Object.entries(files).some(([name, content]) => recorded[name] !== content)) {
+		throw new Error("Distribution asset workspace files rejected");
+	}
+	if (typeof lockfile !== "string" || asset.lockfile?.name !== DISTRIBUTION_ASSETS.lockfile || asset.lockfile?.sha256 !== sha256(lockfile)) {
+		throw new Error("Distribution lockfile sha256 mismatch");
+	}
+	return { manifest, lockfile };
+}
 function versionDirectory(layout, id) {
 	if (typeof id !== "string" || !VERSION_ID.test(id) || id.includes("..")) throw new Error("Unsafe version id");
 	return pathFor(process.platform).join(layout.versions, id);
@@ -426,7 +465,11 @@ export async function installVersion({ layout, manifest, lockfile, platform = la
 		for (const [name, text] of Object.entries({ ...files, "pnpm-lock.yaml": lockfile })) writeFileSync(path.join(destination, name), text, { flag: "wx", mode: 0o600 });
 		const result = await (adapters.run ?? runCommand)(layout.node, [layout.pnpm, "install", "--frozen-lockfile"],
 			{ cwd: destination, env: pnpmEnvironment(layout, { platform, env, go }), timeout: INSTALL_TIMEOUT });
-		if (result.status !== 0) throw Object.assign(new Error("pnpm install failed"), { stderr: String(result.stderr ?? "").slice(-4000) });
+		// pnpm prints install and postinstall failures on stdout: keep both tails.
+		if (result.status !== 0) {
+			throw Object.assign(new Error(`pnpm install failed (exit ${result.status})`),
+				{ stderr: [String(result.stdout ?? "").slice(-6000), String(result.stderr ?? "").slice(-4000)].filter(Boolean).join("\n") });
+		}
 		const shellDirectory = installedPackage(destination, "gentle-pi", shell, "gentle-pi");
 		installedPackage(destination, "@earendil-works/pi-coding-agent", pi, "Pi");
 		if (!regular(path.join(shellDirectory, "bin", "gentle-shell.mjs"))) throw new Error("Installed gentle-pi has no launcher entry");
