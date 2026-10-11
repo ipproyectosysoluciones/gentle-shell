@@ -262,6 +262,8 @@ A small window opens, then the installer appears in your browser. Use the tab it
 >
 > Only download from this repository's [Releases](https://github.com/Gentleman-Programming/gentle-shell/releases) page. To check a download, compare its SHA-256 with [gentle-shell-installers-SHA256SUMS.txt](https://github.com/Gentleman-Programming/gentle-shell/releases/latest/download/gentle-shell-installers-SHA256SUMS.txt).
 
+From the first release that publishes its distribution assets, a new installation instead gets Gentle Shell as one self-contained product. Its own Node.js, npm, pnpm and Pi live in `~/.gentle-shell`, and your own tools are not used or changed ([bundled installation](docs/install-wizard.md#bundled-installation)).
+
 The installer is a preview: it is tested on Linux and in CI, while clean-machine runs on macOS and Windows are still being verified. How it works and what it changes: **[installation wizard](docs/install-wizard.md)**.
 
 ### Path A: standalone `gentle-shell` (recommended, no pi changes)

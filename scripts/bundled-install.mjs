@@ -1,5 +1,5 @@
 // The bundled Gentle Shell install (S2, S3, S6, S7): one private prefix with our
-// own pinned Node and pnpm (and Go only when asked), every pnpm folder inside it,
+// own pinned Node with its npm and pnpm (and Go only when asked), every pnpm and npm folder inside it,
 // one frozen install per version, an atomic `current`, a launcher and one PATH
 // entry. The user's node, npm, pnpm and go are never run, read or changed.
 // Shared by the web installer and `gentle-shell upgrade`; every effect outside
@@ -60,10 +60,14 @@ export function prefixLayout({ platform, env = {}, home, root }) {
 	const nodeDir = path.join(runtime, `node-${pins.node}`);
 	const pnpmDir = path.join(runtime, `pnpm-${pins.pnpm}`);
 	const pnpmHome = path.join(base, "pnpm");
+	const npmHome = path.join(base, "npm");
 	const bin = path.join(base, "bin");
 	return Object.freeze({
 		platform, root: base, agent: path.join(home, ".gentle-shell", "agent"), runtime,
 		nodeDir, node: windows ? path.join(nodeDir, "node.exe") : path.join(nodeDir, "bin", "node"),
+		// The npm bundled in the same Node archive, for Pi's own package installs.
+		npmCli: path.join(nodeDir, ...(windows ? [] : ["lib"]), "node_modules", "npm", "bin", "npm-cli.js"),
+		npmHome, npmPrefix: path.join(npmHome, "prefix"), npmCache: path.join(npmHome, "cache"), npmGlobalConfig: path.join(npmHome, "npmrc"),
 		pnpmDir, pnpm: path.join(pnpmDir, "package", "bin", "pnpm.mjs"),
 		// acquireGo publishes `<goRoot>/<version>/go`.
 		goRoot: path.join(runtime, "go"),
@@ -87,7 +91,8 @@ function ensureDirectory(path, platform) {
 }
 /** The prefix folders and the empty npmrc pnpm reads instead of ~/.npmrc. */
 function prepareFolders(layout) {
-	for (const path of [layout.runtime, layout.pnpmHome, layout.store, layout.cache, layout.state, layout.config, layout.versions, layout.bin, layout.tmp]) {
+	for (const path of [layout.runtime, layout.pnpmHome, layout.store, layout.cache, layout.state, layout.config, layout.npmHome, layout.npmPrefix, layout.npmCache,
+		layout.versions, layout.bin, layout.tmp]) {
 		ensureDirectory(path, layout.platform);
 	}
 	if (!stat(layout.npmrc)) writeFileSync(layout.npmrc, "", { flag: "wx", mode: 0o600 });
@@ -101,10 +106,13 @@ function prepareFolders(layout) {
  * untrusted owner or ACL on %LOCALAPPDATA% moves to the profile candidate. The
  * chosen folder is claimed with the bootstrap's protected DACL and marked
  * (ensureWindowsPrivateFolder); a non-empty unmarked folder is never adopted.
+ * `root`, the consented plan's folder: when the choice differs, it throws
+ * (check "prefix-changed") before anything is created or claimed.
  */
-export function claimPrefix({ platform, env = {}, home, adapters = {} }) {
+export function claimPrefix({ platform, env = {}, home, root, adapters = {} }) {
 	if (platform !== "win32") {
 		const layout = prefixLayout({ platform, env, home });
+		if (root !== undefined && root !== layout.root) throw Object.assign(new Error(`The bundled folder changed since the plan: ${layout.root}`), { check: "prefix-changed" });
 		if (realpathSync(home) !== posix.resolve(home)) throw new Error(`Unsafe bundled prefix: ${home}`);
 		const info = lstatSync(home);
 		if (!info.isDirectory() || info.uid !== process.getuid() || (info.mode & 0o022)) throw new Error(`Unsafe bundled prefix: ${home}`);
@@ -112,9 +120,27 @@ export function claimPrefix({ platform, env = {}, home, adapters = {} }) {
 		(adapters.prepare ?? prepareFolders)(layout);
 		return layout;
 	}
-	const exists = adapters.exists ?? ((path) => stat(path) !== null);
 	const storage = adapters.storage ?? verifyWindowsStorage;
 	const claim = adapters.claim ?? ((folder) => ensureWindowsPrivateFolder(folder, env, { ...WINDOWS_MARKER, storage }));
+	const candidate = prefixRoot({ platform, env, adapters });
+	// The consented plan named a folder: a claim that would choose another one changes nothing.
+	if (root !== undefined && root !== candidate) throw Object.assign(new Error(`The bundled folder changed since the plan: ${candidate}`), { check: "prefix-changed" });
+	claim(candidate);
+	const layout = prefixLayout({ platform, env, home, root: candidate });
+	(adapters.prepare ?? prepareFolders)(layout);
+	return layout;
+}
+
+/** The folder claimPrefix will claim, chosen with read-only checks only, so a
+ * plan shows the same folder the installation uses. POSIX: undefined (the
+ * prefix is always `~/.gentle-shell`). Windows: the first candidate whose
+ * nearest existing folder passes the storage walk; an untrusted owner or ACL
+ * moves to the next candidate, any other failure throws.
+ */
+export function prefixRoot({ platform, env = {}, adapters = {} }) {
+	if (platform !== "win32") return undefined;
+	const exists = adapters.exists ?? ((path) => stat(path) !== null);
+	const storage = adapters.storage ?? verifyWindowsStorage;
 	const candidates = windowsCandidates(env);
 	if (candidates.length === 0) throw new Error("The bundled install has no private folder");
 	for (const [index, candidate] of candidates.entries()) {
@@ -126,10 +152,7 @@ export function claimPrefix({ platform, env = {}, home, adapters = {} }) {
 			if (index + 1 < candidates.length && /^(?:target|parent|ancestor)-(?:owner|acl-mask)$/.test(error?.check ?? "")) continue;
 			throw error;
 		}
-		claim(candidate);
-		const layout = prefixLayout({ platform, env, home, root: candidate });
-		(adapters.prepare ?? prepareFolders)(layout);
-		return layout;
+		return candidate;
 	}
 }
 
@@ -139,10 +162,51 @@ export function claimPrefix({ platform, env = {}, home, adapters = {} }) {
  * skipped and never written: pnpm runs on node alone, so npm is not needed.
  */
 export function nodeExecutable(bytes, descriptor) {
+	const { file, stem } = nodeArchive(descriptor);
+	return file.endsWith(".zip") ? zipMember(bytes, `${stem}/node.exe`) : tarMember(bytes, `${stem}/bin/node`);
+}
+function nodeArchive(descriptor) {
 	const file = String(descriptor?.url ?? "").split("/").pop();
 	const stem = file.replace(/\.(?:tar\.gz|zip)$/, "");
 	if (stem === file || !/^node-v\d+\.\d+\.\d+-[a-z0-9]+-[a-z0-9]+$/.test(stem)) throw new Error("Node archive rejected");
-	return file.endsWith(".zip") ? zipMember(bytes, `${stem}/node.exe`) : tarMember(bytes, `${stem}/bin/node`);
+	return { file, stem };
+}
+// Our own POSIX npm and npx: our Node runs npm's entry next to it, whatever `node` is on PATH.
+const npmWrapper = (entry) => ["#!/bin/sh", "# gentle-shell bundled npm (generated; do not edit)", 'basedir=$(dirname "$0")',
+	`exec "$basedir/node" "$basedir/../lib/node_modules/npm/bin/${entry}" "$@"`, ""].join("\n");
+/** Every file runtime/node-<v>/ holds, from one verified Node archive, as
+ * [{ name (relative, `/`-separated), data, executable }] with `npm` set to the
+ * bundled npm version: the Node executable (as nodeExecutable finds it) and the
+ * npm bundled with it, which Pi runs to install its packages. Windows: npm's
+ * package under node_modules/npm and its npm.cmd and npx.cmd, which run the
+ * node.exe beside them. POSIX: npm's package under lib/node_modules/npm and our
+ * own bin/npm and bin/npx wrappers in place of the archive's links. Links,
+ * Corepack and every other member are skipped; a member leaving its folder, or
+ * an archive without npm, is rejected.
+ */
+export function nodeRuntimeFiles(bytes, descriptor) {
+	const fail = () => { throw new Error("Node archive rejected"); };
+	const { file, stem } = nodeArchive(descriptor);
+	const windows = file.endsWith(".zip");
+	const npm = windows ? "node_modules/npm/" : "lib/node_modules/npm/";
+	const files = [{ name: windows ? "node.exe" : "bin/node", data: nodeExecutable(bytes, descriptor), executable: true }];
+	const keep = (name, data, executable) => {
+		const relative = name.slice(stem.length + 1);
+		if (!name.startsWith(`${stem}/`) || !(relative.startsWith(npm) || (windows && /^np[mx]\.cmd$/.test(relative)))) return;
+		if (relative.split("/").some((part) => part === "" || part === "." || part === "..") || relative.includes("\\")) fail();
+		files.push({ name: relative, data, executable });
+	};
+	if (windows) {
+		for (const entry of zipEntries(bytes, fail)) if (!entry.name.endsWith("/") && !(entry.unix && (entry.mode & 0o170000) !== 0o100000)) keep(entry.name, entry.read(), false);
+	} else {
+		for (const member of tarMembers(bytes, "Node archive rejected")) if (member.type === "0" || member.type === "\0") keep(member.name, Buffer.from(member.data), (member.mode & 0o100) !== 0);
+		files.push({ name: "bin/npm", data: Buffer.from(npmWrapper("npm-cli.js")), executable: true }, { name: "bin/npx", data: Buffer.from(npmWrapper("npx-cli.js")), executable: true });
+	}
+	let metadata = null;
+	try { metadata = JSON.parse(files.find((entry) => entry.name === `${npm}package.json`)?.data.toString("utf8") ?? "null"); }
+	catch { fail(); }
+	if (metadata?.name !== "npm" || !SEMVER.test(metadata.version ?? "") || !files.some((entry) => entry.name === `${npm}bin/npm-cli.js`)) fail();
+	return Object.assign(files, { npm: metadata.version });
 }
 function tarMember(bytes, wanted) {
 	let found = null;
@@ -193,6 +257,20 @@ function* tarMembers(bytes, message) {
 }
 function zipMember(bytes, wanted) {
 	const fail = () => { throw new Error("Node archive rejected"); };
+	let found = null;
+	for (const entry of zipEntries(bytes, fail)) {
+		if (entry.name !== wanted) continue;
+		if (found || (entry.unix && (entry.mode & 0o170000) !== 0o100000)) fail();
+		found = entry.read();
+	}
+	if (!found?.length) fail();
+	return found;
+}
+/** Every central-directory entry of a zip: { name, unix, mode, read() }; read()
+ * checks the entry (no encryption or data descriptor, stored or deflated, its
+ * local header and CRC) and returns its bytes. Anything malformed calls `fail`.
+ */
+function* zipEntries(bytes, fail) {
 	let end = -1;
 	for (let at = bytes.length - 22; at >= Math.max(0, bytes.length - 22 - 0xffff); at -= 1) {
 		if (bytes.readUInt32LE(at) === 0x06054b50 && at + 22 + bytes.readUInt16LE(at + 20) === bytes.length) { end = at; break; }
@@ -201,7 +279,6 @@ function zipMember(bytes, wanted) {
 	const count = bytes.readUInt16LE(end + 10);
 	const directory = bytes.readUInt32LE(end + 16);
 	if (count === 0xffff || directory === 0xffffffff || directory + bytes.readUInt32LE(end + 12) > end) fail();
-	let found = null;
 	for (let at = directory, index = 0; index < count; index += 1) {
 		if (at + 46 > end || bytes.readUInt32LE(at) !== 0x02014b50) fail();
 		const [flags, method, crc, compressed, size] = [bytes.readUInt16LE(at + 8), bytes.readUInt16LE(at + 10), bytes.readUInt32LE(at + 16),
@@ -212,20 +289,18 @@ function zipMember(bytes, wanted) {
 		const local = bytes.readUInt32LE(at + 42);
 		const name = bytes.subarray(at + 46, at + 46 + nameLength).toString("utf8");
 		at += 46 + nameLength + bytes.readUInt16LE(at + 30) + bytes.readUInt16LE(at + 32);
-		if (name !== wanted) continue;
-		if (found || (flags & 0x41) || (method !== 0 && method !== 8) || compressed === 0xffffffff || size === 0xffffffff) fail();
-		if (unix && (mode & 0o170000) !== 0o100000) fail();
-		if (local + 30 > directory || bytes.readUInt32LE(local) !== 0x04034b50) fail();
-		const localName = bytes.readUInt16LE(local + 26);
-		const data = local + 30 + localName + bytes.readUInt16LE(local + 28);
-		if (bytes.subarray(local + 30, local + 30 + localName).toString("utf8") !== name || data + compressed > directory) fail();
-		const raw = bytes.subarray(data, data + compressed);
-		const content = method === 0 ? Buffer.from(raw) : inflateRawSync(raw, { maxOutputLength: Math.max(size, 1) });
-		if (content.length !== size || crc32(content) !== crc) fail();
-		found = content;
+		yield { name, unix, mode, read: () => {
+			if ((flags & 0x41) || (method !== 0 && method !== 8) || compressed === 0xffffffff || size === 0xffffffff) fail();
+			if (local + 30 > directory || bytes.readUInt32LE(local) !== 0x04034b50) fail();
+			const localName = bytes.readUInt16LE(local + 26);
+			const data = local + 30 + localName + bytes.readUInt16LE(local + 28);
+			if (bytes.subarray(local + 30, local + 30 + localName).toString("utf8") !== name || data + compressed > directory) fail();
+			const raw = bytes.subarray(data, data + compressed);
+			const content = method === 0 ? Buffer.from(raw) : inflateRawSync(raw, { maxOutputLength: Math.max(size, 1) });
+			if (content.length !== size || crc32(content) !== crc) fail();
+			return content;
+		} };
 	}
-	if (!found?.length) fail();
-	return found;
 }
 
 /** Runs a command without a shell; resolves { status, stdout, stderr }. */
@@ -267,9 +342,10 @@ async function publishRuntime(layout, name, directory, entry, { platform, arch, 
 	}
 }
 
-/** Our pinned Node and pnpm in runtime/ (and the pinned Go only when `go`),
- * each downloaded through verifiedDownload, checked by running it from its
- * staging folder, marked, then published. Returns the paths and what was acquired.
+/** Our pinned Node with its bundled npm, and pnpm, in runtime/ (and the pinned
+ * Go only when `go`), each downloaded through verifiedDownload, checked by
+ * running it from its staging folder, marked, then published. Returns the
+ * paths and what was acquired.
  */
 export async function ensureRuntime({ layout, platform, arch, go = false, env = {}, adapters = {} }) {
 	const run = adapters.run ?? runCommand;
@@ -277,11 +353,17 @@ export async function ensureRuntime({ layout, platform, arch, go = false, env = 
 	const childEnv = pnpmEnvironment(layout, { platform: layout.platform, env });
 	const acquired = [];
 	const node = await publishRuntime(layout, "node", layout.nodeDir, layout.node, { platform, arch, adapters }, async (stage, bytes, descriptor) => {
+		const files = nodeRuntimeFiles(bytes, descriptor);
+		for (const file of files) {
+			const target = path.join(stage, ...file.name.split("/"));
+			mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+			writeFileSync(target, file.data, { flag: "wx", mode: file.executable ? 0o700 : 0o600 });
+		}
 		const binary = path.join(stage, path.relative(layout.nodeDir, layout.node));
-		mkdirSync(path.dirname(binary), { recursive: true, mode: 0o700 });
-		writeFileSync(binary, nodeExecutable(bytes, descriptor), { flag: "wx", mode: 0o700 });
 		const result = await run(binary, ["--version"], { cwd: layout.runtime, env: childEnv });
 		if (result.status !== 0 || String(result.stdout).trim() !== `v${descriptor.version}`) throw new Error("Bundled Node verification failed");
+		const npm = await run(binary, [path.join(stage, path.relative(layout.nodeDir, layout.npmCli)), "--version"], { cwd: layout.runtime, env: childEnv });
+		if (npm.status !== 0 || String(npm.stdout).trim() !== files.npm) throw new Error("Bundled npm verification failed");
 	});
 	if (node) acquired.push("node");
 	const pnpm = await publishRuntime(layout, "pnpm", layout.pnpmDir, layout.pnpm, { platform, arch, adapters }, async (stage, bytes, descriptor) => {
@@ -319,15 +401,18 @@ export async function ensureRuntime({ layout, platform, arch, go = false, env = 
  * npmrc in place of ~/.npmrc; no switching to the pnpm a package.json above the
  * folder names (pm-on-fail otherwise defaults to "download") or to a Node runtime
  * a root manifest asks to download (runtime-on-fail), and no update check; on
- * Windows TEMP/TMP in the private folder. Every inherited npm/pnpm/Corepack
- * setting, NODE_OPTIONS and NODE_PATH is dropped; the rest (HOME, proxies,
- * SystemRoot) is kept.
+ * Windows TEMP/TMP in the private folder. Every inherited npm/pnpm/Corepack setting, NODE_OPTIONS and
+ * NODE_PATH is dropped, except a variable the prefix npmrc references as
+ * `${NAME}` (an auth token such as NPM_TOKEN, which pnpm and npm expand); the
+ * rest (HOME, proxies, SystemRoot) is kept.
  */
 export function pnpmEnvironment(layout, { platform = layout.platform, env = {}, go = null } = {}) {
 	const windows = platform === "win32";
 	const path = pathFor(platform);
 	const dropped = new RegExp(`^(?:npm_.*|pnpm_.*|corepack_.*|node_options|node_path|xdg_(?:config|cache|state|data)_home|path${windows ? "|temp|tmp" : ""})$`, "i");
-	const kept = Object.fromEntries(Object.entries(env).filter(([key]) => !dropped.test(key)));
+	const referenced = new Set([...(read(layout.npmrc) ?? "").matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g)].map((match) => match[1])
+		.filter((name) => !/^(?:npm_config_.*|pnpm_.*)$/i.test(name)));
+	const kept = Object.fromEntries(Object.entries(env).filter(([key]) => !dropped.test(key) || referenced.has(key)));
 	const rest = String(envValue(env, "PATH", platform) ?? "").split(path.delimiter).filter((entry) => entry.length > 0);
 	const first = [path.dirname(layout.node), ...(go ? [path.dirname(go)] : [])];
 	return {
@@ -340,6 +425,80 @@ export function pnpmEnvironment(layout, { platform = layout.platform, env = {}, 
 		pnpm_config_pm_on_fail: "ignore", pnpm_config_runtime_on_fail: "ignore", pnpm_config_update_notifier: "false",
 		...(windows ? { TEMP: layout.tmp, TMP: layout.tmp } : {}),
 	};
+}
+/** Our npm's settings, for the children that run npm (setupEnvironment; pnpm
+ * never runs it): the prefix npmrc as its user config, and its global config,
+ * global prefix and cache inside the prefix, so nothing reads the user's npm
+ * settings or writes the user's npm folders. The prefix also keeps Windows'
+ * npm.cmd on our npm: it prefers an npm installed in the global prefix.
+ */
+function npmEnvironment(layout) {
+	return { npm_config_userconfig: layout.npmrc, npm_config_globalconfig: layout.npmGlobalConfig, npm_config_prefix: layout.npmPrefix,
+		npm_config_cache: layout.npmCache, npm_config_update_notifier: "false" };
+}
+/** The environment `gentle-shell setup` runs in from the bundled install: our
+ * Node and its npm first on PATH, then the version's node_modules/.bin (its
+ * `pi`), then the user's PATH; npm's settings inside the prefix
+ * (npmEnvironment). Inherited npm and pnpm settings, NODE_OPTIONS, NODE_PATH
+ * and the wizard's GENTLE_BOOTSTRAP_ and GENTLE_INSTALL_ handoff are dropped;
+ * the user's XDG folders are kept, since Pi and Gentle AI read their own
+ * configuration through them.
+ */
+export function setupEnvironment(layout, { platform = layout.platform, env = {}, id }) {
+	if (typeof id !== "string" || !VERSION_ID.test(id) || id.includes("..")) throw new Error("Unsafe version id");
+	const path = pathFor(platform);
+	const dropped = /^(?:npm_config_.*|pnpm_.*|corepack_.*|node_options|node_path|path|gentle_(?:bootstrap|install)_.*)$/i;
+	const kept = Object.fromEntries(Object.entries(env).filter(([key]) => !dropped.test(key)));
+	const rest = String(envValue(env, "PATH", platform) ?? "").split(path.delimiter).filter((entry) => entry.length > 0);
+	const bin = path.join(layout.versions, id, "node_modules", ".bin");
+	return { ...kept, [platform === "win32" ? "Path" : "PATH"]: [path.dirname(layout.node), bin, ...rest].join(path.delimiter), ...npmEnvironment(layout) };
+}
+
+// S12: the only npmrc keys our pnpm and npm read from the user's npmrc.
+const NPMRC_KEYS = /^(?:registry|@[^\s:=]+:registry|\/\/\S+:(?:_authToken|_auth|username|_password|certfile|keyfile)|proxy|https-proxy|noproxy|no-proxy|ca|ca\[\]|cafile|strict-ssl)$/;
+/** The user's npmrc reduced to its network, registry and authentication keys:
+ * registry, @scope:registry, per-host //host/:_authToken, _auth, username,
+ * _password, certfile and keyfile, proxy, https-proxy, noproxy (no-proxy), ca
+ * (ca[]), cafile and strict-ssl. Each kept line is copied verbatim, so `${VAR}`
+ * references stay for pnpm and npm to expand. Comments and every other key are
+ * dropped, and so is everything from the first [section] on: an ini section
+ * never applies at the top level.
+ */
+export function filterNpmrc(text) {
+	const kept = [];
+	for (const raw of String(text ?? "").split(/\r\n|\r|\n/)) {
+		const line = raw.trim();
+		if (line.startsWith("[")) break;
+		const at = line.indexOf("=");
+		if (line.startsWith("#") || line.startsWith(";") || at <= 0) continue;
+		const key = line.slice(0, at).trim().replace(/^(["'])(.*)\1$/, "$2");
+		if (NPMRC_KEYS.test(key)) kept.push(line);
+	}
+	return kept.length > 0 ? `${kept.join("\n")}\n` : "";
+}
+/** The user's npmrc text: NPM_CONFIG_USERCONFIG (any case) when it is an
+ * absolute path, otherwise ~/.npmrc; empty when that file is missing. At most
+ * 1 MiB is read.
+ */
+export function userNpmrc({ platform, env = {}, home }) {
+	const path = pathFor(platform);
+	const key = Object.keys(env).find((name) => name.toLowerCase() === "npm_config_userconfig");
+	const file = key && path.isAbsolute(env[key] ?? "") ? env[key] : path.join(home, ".npmrc");
+	let text;
+	try { text = readFileSync(file); }
+	catch (error) { if (error.code === "ENOENT" || error.code === "ENOTDIR") return ""; throw error; }
+	if (text.length > 1024 * 1024) throw new Error(`The npm user configuration is too large: ${file}`);
+	return text.toString("utf8");
+}
+/** Replaces the prefix npmrc (layout.npmrc, the file pnpm and npm read in place
+ * of ~/.npmrc) with filterNpmrc(text), mode 0600, with one rename.
+ */
+export function writeNpmrcAuth(layout, text) {
+	const content = filterNpmrc(text);
+	replaceAtomically(layout.npmrc, (temp) => {
+		writeFileSync(temp, content, { flag: "wx", mode: 0o600 });
+		if (layout.platform !== "win32") chmodSync(temp, 0o600);
+	});
 }
 
 function versionsOf(manifest) {

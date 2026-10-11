@@ -1170,6 +1170,6 @@ test("the CI native Windows gate requires exactly the native tests the Windows b
 	const gate = /\[int\]\$passes\.Groups\[1\]\.Value -ne (\d+) -or/.exec(ci);
 	assert.ok(gate, "the gate compares the passed count exactly");
 	assert.ok(/\[int\]\$skips\.Groups\[1\]\.Value -ne 0/.test(ci), "0 skips stays required");
-	assert.equal(literal + modes, 36);
+	assert.equal(literal + modes, 37);
 	assert.equal(Number(gate[1]), literal + modes);
 });
