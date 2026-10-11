@@ -136,7 +136,8 @@ function harness({ platform = "linux", path = profile as Record<string, unknown>
 		platform, arch: "x64", env: { PATH: "/usr/bin", HOME: "/home/u" }, home: platform === "win32" ? "C:\\U" : "/home/u", distribution: published, registry,
 		log: (entry: { step: string; status: string }) => log.push(entry),
 		operations: {
-			claimPrefix: () => step("claim", layout),
+			// The runner claims exactly the consented folder (claimPrefix refuses another one).
+			claimPrefix: (options: { root?: string }) => { assert.equal(options.root, plan.bundled.root); return step("claim", layout); },
 			userNpmrc: () => "registry=https://r.example/\nsave-exact=true\n",
 			writeNpmrcAuth: (_: unknown, text: string) => step(`npmrc ${text.trim()}`, undefined),
 			ensureRuntime: async (options: { go: boolean }) => step(`runtime go=${options.go}`, { node: layout.node, pnpm: layout.pnpm, go: options.go ? "C:\\L\\gentle-shell\\runtime\\go\\1.25.14\\go\\bin\\go.exe" : null, acquired: [] }),

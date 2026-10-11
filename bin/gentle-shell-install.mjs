@@ -11,7 +11,7 @@ import { childEnvironment, goFirstEnvironment, lookPath, packageNativeGentleAi, 
 import { createInstallerServer } from "../scripts/installer-server.mjs";
 import { configHome, mainChannelAdapter, runUpgrade } from "../scripts/main-channel.mjs";
 import { ensureWindowsPnpmHome, windowsWizardEnvironment } from "../scripts/installer-windows.mjs";
-import { pathEntryPlan, prefixLayout } from "../scripts/bundled-install.mjs";
+import { pathEntryPlan, prefixLayout, prefixRoot } from "../scripts/bundled-install.mjs";
 import { DISTRIBUTION_RELEASES, bundledGate, bundledPlan, fetchDistribution, runBundledInstall, windowsPathRegistry } from "../scripts/bundled-wizard.mjs";
 
 // Browser installation wizard entry, started by the bootstrap with no argv.
@@ -162,7 +162,8 @@ export function wizardHandlers({ platform, arch, env, run, fs, distributionBase 
 				? await fetchDistribution({ version: requirements.shell, base: distributionBase, ...(download ? { download } : {}) }) : null;
 			if (bundledGate({ channel, inventory, distribution: assets, version: requirements.shell })) {
 				distribution = assets;
-				const layout = prefixLayout({ platform, env: user, home });
+				// The folder the claim will take (Windows may fall back to the profile), from read-only checks.
+				const layout = prefixLayout({ platform, env: user, home, root: prefixRoot({ platform, env: user }) });
 				return { inventory, plan: bundledPlan({ platform, distribution: assets, layout, path: pathEntryPlan(layout, { platform, env: user, home }) }) };
 			}
 			return { inventory, plan: planPreflight(inventory, { channel }) };

@@ -106,10 +106,13 @@ function prepareFolders(layout) {
  * untrusted owner or ACL on %LOCALAPPDATA% moves to the profile candidate. The
  * chosen folder is claimed with the bootstrap's protected DACL and marked
  * (ensureWindowsPrivateFolder); a non-empty unmarked folder is never adopted.
+ * `root`, the consented plan's folder: when the choice differs, it throws
+ * (check "prefix-changed") before anything is created or claimed.
  */
-export function claimPrefix({ platform, env = {}, home, adapters = {} }) {
+export function claimPrefix({ platform, env = {}, home, root, adapters = {} }) {
 	if (platform !== "win32") {
 		const layout = prefixLayout({ platform, env, home });
+		if (root !== undefined && root !== layout.root) throw Object.assign(new Error(`The bundled folder changed since the plan: ${layout.root}`), { check: "prefix-changed" });
 		if (realpathSync(home) !== posix.resolve(home)) throw new Error(`Unsafe bundled prefix: ${home}`);
 		const info = lstatSync(home);
 		if (!info.isDirectory() || info.uid !== process.getuid() || (info.mode & 0o022)) throw new Error(`Unsafe bundled prefix: ${home}`);
@@ -117,9 +120,27 @@ export function claimPrefix({ platform, env = {}, home, adapters = {} }) {
 		(adapters.prepare ?? prepareFolders)(layout);
 		return layout;
 	}
-	const exists = adapters.exists ?? ((path) => stat(path) !== null);
 	const storage = adapters.storage ?? verifyWindowsStorage;
 	const claim = adapters.claim ?? ((folder) => ensureWindowsPrivateFolder(folder, env, { ...WINDOWS_MARKER, storage }));
+	const candidate = prefixRoot({ platform, env, adapters });
+	// The consented plan named a folder: a claim that would choose another one changes nothing.
+	if (root !== undefined && root !== candidate) throw Object.assign(new Error(`The bundled folder changed since the plan: ${candidate}`), { check: "prefix-changed" });
+	claim(candidate);
+	const layout = prefixLayout({ platform, env, home, root: candidate });
+	(adapters.prepare ?? prepareFolders)(layout);
+	return layout;
+}
+
+/** The folder claimPrefix will claim, chosen with read-only checks only, so a
+ * plan shows the same folder the installation uses. POSIX: undefined (the
+ * prefix is always `~/.gentle-shell`). Windows: the first candidate whose
+ * nearest existing folder passes the storage walk; an untrusted owner or ACL
+ * moves to the next candidate, any other failure throws.
+ */
+export function prefixRoot({ platform, env = {}, adapters = {} }) {
+	if (platform !== "win32") return undefined;
+	const exists = adapters.exists ?? ((path) => stat(path) !== null);
+	const storage = adapters.storage ?? verifyWindowsStorage;
 	const candidates = windowsCandidates(env);
 	if (candidates.length === 0) throw new Error("The bundled install has no private folder");
 	for (const [index, candidate] of candidates.entries()) {
@@ -131,10 +152,7 @@ export function claimPrefix({ platform, env = {}, home, adapters = {} }) {
 			if (index + 1 < candidates.length && /^(?:target|parent|ancestor)-(?:owner|acl-mask)$/.test(error?.check ?? "")) continue;
 			throw error;
 		}
-		claim(candidate);
-		const layout = prefixLayout({ platform, env, home, root: candidate });
-		(adapters.prepare ?? prepareFolders)(layout);
-		return layout;
+		return candidate;
 	}
 }
 

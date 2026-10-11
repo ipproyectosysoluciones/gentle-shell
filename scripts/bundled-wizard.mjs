@@ -133,7 +133,7 @@ export async function runBundledInstall(request, adapters) {
 	let detail = null;
 	const lastLine = (result) => setupErrorDetail(result?.stderr, home, platform) ?? setupErrorDetail(result?.stdout, home, platform);
 	const steps = [
-		["claim-prefix", () => { layout = ops.claimPrefix({ platform, env, home }); }],
+		["claim-prefix", () => { layout = ops.claimPrefix({ platform, env, home, root: consented.root }); }],
 		["copy-npm-settings", () => ops.writeNpmrcAuth(layout, ops.userNpmrc({ platform, env, home }))],
 		["install-runtime", async () => { runtime = await ops.ensureRuntime({ layout, platform, arch, go: platform === "win32", env }); }],
 		["install-version", async () => {

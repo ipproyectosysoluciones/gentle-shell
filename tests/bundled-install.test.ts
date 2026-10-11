@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import test, { after, type TestContext } from "node:test";
 import { crc32, gzipSync } from "node:zlib";
-import { activateVersion, activeVersion, applyPathEntry, claimPrefix, distributionFiles, ensureLauncher, ensureRuntime, filterNpmrc, installVersion, nodeExecutable,
+import { activateVersion, activeVersion, applyPathEntry, claimPrefix, prefixRoot, distributionFiles, ensureLauncher, ensureRuntime, filterNpmrc, installVersion, nodeExecutable,
 	nodeRuntimeFiles, pathEntryPlan, pnpmEnvironment, prefixLayout, pruneVersions, removePathEntry, setupEnvironment, userNpmrc, writeNpmrcAuth } from "../scripts/bundled-install.mjs";
 
 // Real directories, modes, symlinks and uids need a POSIX host.
@@ -201,6 +201,29 @@ test("claimPrefix on Windows walks then claims %LOCALAPPDATA%, falling back to t
 	assert.deepEqual(moved.claims, [fallback]);
 	assert.throws(() => run({ "C:\\Users\\me\\AppData": "parent-reparse" }), /ACL evidence/);
 	assert.throws(() => run({ "C:\\": "ancestor-acl-mask" }), /ACL evidence/);
+});
+
+test("the plan's prefix is the folder claimPrefix will claim, and a claim that would choose another folder changes nothing", () => {
+	const env = { LOCALAPPDATA: "C:\\Users\\me\\AppData\\Local", USERPROFILE: "C:\\Users\\me" };
+	const primary = "C:\\Users\\me\\AppData\\Local\\gentle-shell";
+	const fallback = "C:\\Users\\me\\.gentle-shell-bundle";
+	const adapters = (failing: string | null, claims: string[]) => ({
+		exists: (path: string) => path !== primary && path !== fallback,
+		prepare: () => {},
+		storage: (path: string) => { if (failing && path.startsWith(failing)) throw Object.assign(new Error("Windows ACL evidence rejected"), { check: "parent-acl-mask" }); },
+		claim: (path: string) => { claims.push(path); return "claimed"; },
+	});
+	const none: string[] = [];
+	assert.equal(prefixRoot({ platform: "win32", env, adapters: adapters(null, none) }), primary);
+	assert.equal(prefixRoot({ platform: "win32", env, adapters: adapters("C:\\Users\\me\\AppData", none) }), fallback, "the same fallback the claim takes");
+	assert.equal(prefixRoot({ platform: "linux", env: { HOME: "/home/me" } }), undefined, "POSIX keeps ~/.gentle-shell");
+	assert.deepEqual(none, [], "choosing the plan's folder claims nothing");
+	const claims: string[] = [];
+	assert.throws(() => claimPrefix({ platform: "win32", env, home: "C:\\Users\\me", root: primary, adapters: adapters("C:\\Users\\me\\AppData", claims) }),
+		(error: { check?: string; message: string }) => error.check === "prefix-changed" && error.message.includes(fallback));
+	assert.deepEqual(claims, [], "nothing is claimed when the folder differs from the consented one");
+	assert.equal(claimPrefix({ platform: "win32", env, home: "C:\\Users\\me", root: fallback, adapters: adapters("C:\\Users\\me\\AppData", claims) }).root, fallback);
+	assert.deepEqual(claims, [fallback]);
 });
 
 test("ensureWindowsPrivateFolder runs the PNPM_HOME claim with only the folder and its marker as data", async () => {
