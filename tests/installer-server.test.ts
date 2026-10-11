@@ -5,7 +5,7 @@ import * as fsPromises from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
-import { join, posix } from "node:path";
+import { join } from "node:path";
 import test from "node:test";
 import { exitCodeFor, openBrowser, openerFor, redirectPage, runnerEnvironment, upgradeEnvironment, wizardHandlers, writeRedirect } from "../bin/gentle-shell-install.mjs";
 import { planPreflight, requirements } from "../scripts/installer-preflight.mjs";
@@ -1470,7 +1470,9 @@ test("bundled outcomes: every bundled step has guidance, pnpm's error line is sh
 	}
 });
 
-test("wizardHandlers plans the bundled install only when the gate says so, and routes its plan to the bundled runner", async () => {
+// Simulates Linux against the real filesystem (profile files), so it runs on the POSIX runners only.
+test("wizardHandlers plans the bundled install only when the gate says so, and routes its plan to the bundled runner",
+	{ skip: process.platform === "win32" ? "simulated Linux paths need a POSIX filesystem" : false }, async () => {
 	const home = mkdtempSync(join(tmpdir(), "gentle-wizard-handlers-"));
 	try {
 		const asset = distributionAsset({ shell: requirements.shell, pi: "1.0.2" }, "lock");
@@ -1480,14 +1482,12 @@ test("wizardHandlers plans the bundled install only when the gate says so, and r
 			if (!published) throw Object.assign(new Error("Download responded 404"), { status: 404 });
 			return Buffer.from(url.endsWith(".json") ? asset : "lock");
 		};
-		// The simulated platform is Linux, so its home is a POSIX path on every runner (a Windows temp dir is not).
-		const posixHome = process.platform === "win32" ? "/home/gentle-tester" : home;
-		const env = { HOME: posixHome, PATH: "/usr/bin", SHELL: "/bin/bash" };
+		const env = { HOME: home, PATH: "/usr/bin", SHELL: "/bin/bash" };
 		const handlers = (published: boolean, inventory = cleanInventory) => wizardHandlers({ platform: "linux", arch: "x64", env, run: async () => ({}), fs: {},
 			download: download(published), inventory: async () => structuredClone(inventory) });
 		const bundled = await handlers(true).collectPlan("release");
 		assert.equal(bundled.plan.bundled.shell, requirements.shell);
-		assert.equal(bundled.plan.bundled.root, posix.join(posixHome, ".gentle-shell"));
+		assert.equal(bundled.plan.bundled.root, join(home, ".gentle-shell"));
 		assert.equal(bundled.plan.bundled.path.kind, "profile");
 		assert.deepEqual(urls, [`https://github.com/Gentleman-Programming/gentle-shell/releases/download/v${requirements.shell}/gentle-shell-distribution.json`,
 			`https://github.com/Gentleman-Programming/gentle-shell/releases/download/v${requirements.shell}/gentle-shell-distribution-lock.yaml`]);
