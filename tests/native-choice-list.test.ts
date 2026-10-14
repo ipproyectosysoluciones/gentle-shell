@@ -213,3 +213,23 @@ test("native choice list composes rows through the shared pointer scope", () => 
 		spy.mock.restore();
 	}
 });
+
+test("list keeps the selection inside a bounded scroll viewport", () => {
+	const items = Array.from({ length: 20 }, (_, index) => ({
+		id: `item-${index}`,
+		label: `Item ${index + 1}`,
+	}));
+	const list = new NativeChoiceList(items, theme);
+	const height = 5;
+	list.setSelectedIndex(12);
+	const windowed = list.renderViewport(40, height);
+	assert.equal(windowed.length, height, "the viewport renders exactly the visible rows");
+	const plain = windowed.map((line) => stripTerminalSequences(line));
+	const marker = plain.findIndex((line) => line.includes("→"));
+	assert.ok(marker >= 0, "the selection marker stays visible inside the viewport");
+	assert.ok(plain[marker].includes("Item 13"), "the selected row is the one marked");
+	// Wheel/arrow movement past the window keeps the selection visible.
+	list.setSelectedIndex(0);
+	const top = list.renderViewport(40, height).map((line) => stripTerminalSequences(line));
+	assert.ok(top[0].includes("Item 1"), "scrolling back up returns the window to the first rows");
+});

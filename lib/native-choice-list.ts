@@ -41,6 +41,8 @@ export class NativeChoiceList<T extends NativeChoiceItem> extends Container {
 	private disabled = false;
 	private readonly pointerScope = new NativePointerScope();
 	private renderedWidth: number | undefined;
+	private scrollOffset = 0;
+	private lastTotalLines = 0;
 
 	constructor(items: readonly T[], theme: NativeChoiceListTheme, keybindings?: KeybindingsManager) {
 		super();
@@ -84,11 +86,52 @@ export class NativeChoiceList<T extends NativeChoiceItem> extends Container {
 		return this.pointerScope.createMouseObserver(requestRender);
 	}
 
+	/**
+	 * Render only the rows visible inside a `height` line window, keeping the
+	 * selected row always visible. The full layout still drives mouse mapping;
+	 * `handleMouse` translates window coordinates back into full-list rows.
+	 */
+	renderViewport(width: number, height: number): string[] {
+		if (width <= 0 || height <= 0) return [];
+		const childLines: string[][] = [];
+		const lines: string[] = [];
+		for (const child of this.children) {
+			const rendered = child.render(width);
+			childLines.push(rendered);
+			lines.push(...rendered);
+		}
+		this.lastTotalLines = lines.length;
+		if (lines.length <= height) {
+			this.scrollOffset = 0;
+			return lines;
+		}
+		let top = 0;
+		let selectedTop = 0;
+		let selectedHeight = 1;
+		for (const [index, rendered] of childLines.entries()) {
+			if (index === this.selected) {
+				selectedTop = top;
+				selectedHeight = Math.max(1, rendered.length);
+				break;
+			}
+			top += rendered.length;
+		}
+		if (selectedTop < this.scrollOffset) this.scrollOffset = selectedTop;
+		else if (selectedTop + selectedHeight > this.scrollOffset + height) {
+			this.scrollOffset = selectedTop + selectedHeight - height;
+		}
+		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, lines.length - height));
+		return lines.slice(this.scrollOffset, this.scrollOffset + height);
+	}
+
 	override handleMouse(event: TuiMouseEvent) {
-		const result = super.handleMouse(event);
+		const shifted = this.scrollOffset > 0
+			? { ...event, y: event.y + this.scrollOffset, height: this.lastTotalLines }
+			: event;
+		const result = super.handleMouse(shifted);
 		if (result || this.disabled || event.type !== "wheel" || !event.wheelDelta) return result;
 		const before = this.selected;
-		this.setSelectedIndex(this.selected + (event.wheelDelta < 0 ? -1 : 1));
+		this.setSelectedIndex(this.selected + (shifted.wheelDelta < 0 ? -1 : 1));
 		return {
 			handled: true as const,
 			render: before !== this.selected,

@@ -4047,8 +4047,6 @@ class ProfilesPanel implements OverlayComponent {
 
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
-		const listWidth = measureAgentsViewLayout(safeWidth, PROFILES_PANEL_MIN_BODY_ROWS + 3).listWidth;
-		const listLines = this.list.render(listWidth);
 		// The frame fills the overlay, and the overlay fills the terminal, so the
 		// body height comes from the terminal rows rather than from the content.
 		const rows = Math.max(PROFILES_PANEL_MIN_BODY_ROWS + 3, Math.floor(this.rows()));
@@ -4057,6 +4055,9 @@ class ProfilesPanel implements OverlayComponent {
 			this.pointerLayout = undefined;
 			return [];
 		}
+		// The list renders inside a bounded viewport so the selection stays visible
+		// when there are more profiles than body rows.
+		const listLines = this.list.renderViewport(layout.listWidth, layout.bodyRows);
 		const selectedId = this.list.getSelectedItem()?.id;
 		if (selectedId !== this.lastSelectedId) {
 			this.lastSelectedId = selectedId;
