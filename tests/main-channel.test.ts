@@ -342,3 +342,31 @@ test("upgrading main stops before building when the pinned Go cannot be download
 		assert.equal(w.builtWith(), undefined);
 	} finally { w.cleanup(); }
 });
+
+test("the latest main commit prefers git ls-remote over the rate-limited REST API", async () => {
+	const commands: Call[] = [];
+	const run = async (command: string, argv: string[]) => {
+		commands.push({ command, argv, options: {} });
+		return { code: 0, stdout: `${SHELL_SHA}\trefs/heads/main\n` };
+	};
+	const fetch = async () => ({ ok: false, status: 403, text: async () => "API rate limit exceeded" });
+	assert.equal(await resolveMainCommit("Gentleman-Programming/gentle-shell", { fetch, run }), SHELL_SHA);
+	assert.deepEqual(commands, [
+		{ command: "git", argv: ["ls-remote", "https://github.com/Gentleman-Programming/gentle-shell", "refs/heads/main"], options: {} },
+	]);
+});
+
+test("the REST fallback honors GITHUB_TOKEN when git ls-remote cannot resolve the commit", async () => {
+	const run = async () => ({ code: 128, stdout: "" });
+	const headersSeen: Array<Record<string, string>> = [];
+	const fetch = async (_url: string, init: { headers: Record<string, string> }) => {
+		headersSeen.push(init.headers);
+		return { ok: true, status: 200, text: async () => `${SHELL_SHA}\n` };
+	};
+	const env: Record<string, string> = { GITHUB_TOKEN: "ghp-test-token" };
+	assert.equal(await resolveMainCommit("Gentleman-Programming/gentle-shell", { fetch, run, env }), SHELL_SHA);
+	assert.ok(headersSeen.some((headers) => headers.Authorization === "Bearer ghp-test-token"));
+	// A ls-remote that answers garbage also falls back instead of failing closed.
+	const garbage = async () => ({ code: 0, stdout: "fatal: repository not found\n" });
+	assert.equal(await resolveMainCommit("Gentleman-Programming/gentle-shell", { fetch, run: garbage, env }), SHELL_SHA);
+});

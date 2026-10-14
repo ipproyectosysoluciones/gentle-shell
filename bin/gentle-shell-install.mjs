@@ -208,6 +208,9 @@ export function wizardHandlers({ platform, arch, env, run, fs, distributionBase 
 					} });
 			}
 			const { runnerEnv, ctx } = await runnerContext();
+			// A main plan's ls-remote resolution runs git with the same runner and
+			// environment the upgrade's other children use (#2183).
+			const mainChannel = mainChannelAdapter({ fs: fsPromises, run: managers(runnerEnv, null).run, env: ctx.env });
 			return runStandardInstall(request, {
 			platform,
 			nodePath: process.execPath,
@@ -236,7 +239,7 @@ export function wizardHandlers({ platform, arch, env, run, fs, distributionBase 
 			})) === 0,
 			verifyGentleAi: packageNativeGentleAi,
 			// Only a main plan uses it: network access and writes under ~/.pi/gentle-ai.
-			mainChannel: mainChannelAdapter({ fs: fsPromises }),
+			mainChannel,
 			log,
 		});
 		},

@@ -77,13 +77,24 @@ export async function writeChannel(ctx, state, fs) {
 	await fs.rename(`${path}.tmp`, path);
 }
 
-/** Latest commit of `main` as an exact SHA (GitHub's raw-SHA media type). */
-export async function resolveMainCommit(repository, { fetch }) {
+/** Latest commit of `main` as an exact SHA. Prefers `git ls-remote`, which
+ * needs no GitHub REST API quota (#2183); the REST API stays as the fallback
+ * and honors GITHUB_TOKEN when the environment provides one. */
+export async function resolveMainCommit(repository, { fetch, run, env = process.env }) {
+	if (run) {
+		const result = await run("git", ["ls-remote", `https://github.com/${repository}`, "refs/heads/main"], { deadlineMs: deadlines.version });
+		const sha = succeeded(result)
+			? String(result.stdout ?? "").split(/\r?\n/)
+				.map((line) => line.trim().split("\t"))
+				.find(([id, ref]) => ref === "refs/heads/main" && SHA.test(id))?.[0]
+			: undefined;
+		if (sha !== undefined) return sha;
+	}
+	const headers = { Accept: "application/vnd.github.sha", "User-Agent": "gentle-shell" };
+	if (env.GITHUB_TOKEN) headers.Authorization = `Bearer ${env.GITHUB_TOKEN}`;
 	let response;
 	try {
-		response = await fetch(`https://api.github.com/repos/${repository}/commits/main`, {
-			headers: { Accept: "application/vnd.github.sha", "User-Agent": "gentle-shell" },
-		});
+		response = await fetch(`https://api.github.com/repos/${repository}/commits/main`, { headers });
 	} catch {
 		throw new MainChannelError("main-commit-unavailable", `the latest main commit of ${repository} could not be fetched`);
 	}
@@ -210,9 +221,9 @@ export async function packMainShell({ commit, ctx, fetch, run, pnpm, fs, platfor
 }
 
 /** The installer runner's main-channel adapter over real network and files. */
-export function mainChannelAdapter({ fetch = globalThis.fetch, fs }) {
+export function mainChannelAdapter({ fetch = globalThis.fetch, fs, run, env = process.env }) {
 	return {
-		resolveCommit: (repository) => resolveMainCommit(repository, { fetch }),
+		resolveCommit: (repository) => resolveMainCommit(repository, { fetch, run, env }),
 		buildGentleAi: ({ commit, goPath, platform, ctx, run }) => buildMainGentleAi({ commit, ctx, platform, goPath, run, fs }),
 		packShell: ({ commit, ctx, run, pnpm, platform }) => packMainShell({ commit, ctx, fetch, run, pnpm, fs, platform }),
 		writeChannel: (ctx, state) => writeChannel(ctx, state, fs),
@@ -431,8 +442,8 @@ export async function runUpgrade({ args, ctx, platform, arch = process.arch, pac
 		throw new MainChannelError("main-requires-tools", "the main channel packs Gentle Shell with pnpm; put it on PATH (Gentle AI is built with your Go, or with a pinned Go downloaded for the build)");
 	}
 	const acquire = adapters.acquireGo ?? (() => acquirePinnedGo({ root: join(configHome(ctx), "tools", "go"), platform, arch }));
-	const gentleAiCommit = await resolveMainCommit(GENTLE_AI_REPOSITORY, { fetch });
-	const shellCommit = await resolveMainCommit(SHELL_REPOSITORY, { fetch });
+	const gentleAiCommit = await resolveMainCommit(GENTLE_AI_REPOSITORY, { fetch, run, env: ctx.env });
+	const shellCommit = await resolveMainCommit(SHELL_REPOSITORY, { fetch, run, env: ctx.env });
 	const onMain = state.channel === "main";
 	const aiCurrent = onMain && state.gentleAiCommit === gentleAiCommit;
 	const shellCurrent = onMain && state.shellCommit === shellCommit && currentVersion.endsWith(`-main.${shellCommit.slice(0, 12)}`);

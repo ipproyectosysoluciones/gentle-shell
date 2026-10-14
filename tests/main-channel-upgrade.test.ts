@@ -169,7 +169,12 @@ test("a main install already at both latest main commits changes nothing", async
 		await writeChannel(w.ctx, { channel: "main", shellCommit: SHELL_SHA, gentleAiCommit: AI_SHA }, fsPromises);
 		assert.equal(await w.upgrade([], "4.0.0-main.6e7e3a18f794"), 0);
 		assert.deepEqual(w.lines, ["gentle-shell is already at the latest main: Gentle Shell 6e7e3a18f794, Gentle AI 1f9d5e6423e3."]);
-		assert.deepEqual(w.calls, []);
+		// The two `git ls-remote` resolutions are the only commands that run (#2183);
+		// already-latest main still builds and installs nothing.
+		assert.deepEqual(w.calls, [
+			{ command: "git", argv: ["ls-remote", "https://github.com/Gentleman-Programming/gentle-ai", "refs/heads/main"] },
+			{ command: "git", argv: ["ls-remote", "https://github.com/Gentleman-Programming/gentle-shell", "refs/heads/main"] },
+		]);
 	} finally { w.cleanup(); }
 });
 
