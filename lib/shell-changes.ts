@@ -27,6 +27,8 @@ export interface ChangesModel {
 	files: ChangedFile[];
 	added: number;
 	deleted: number;
+	/** Stored once per model build; the footer memo reads it every keystroke. */
+	digest?: string;
 }
 
 export interface ChangesSnapshot {
@@ -63,7 +65,7 @@ const HAS_RENAME_BRACES = /\{[^{}]* => [^{}]*\}/;
 const RENAME_ARROW = " => ";
 
 export function emptyChanges(): ChangesModel {
-	return { files: [], added: 0, deleted: 0 };
+	return { files: [], added: 0, deleted: 0, digest: EMPTY_CHANGES_DIGEST };
 }
 
 function renamedPath(path: string): string {
@@ -124,8 +126,41 @@ export function changesModel(changed: ChangedFile[]): ChangesModel {
 		files,
 		added: files.reduce((total, file) => total + file.added, 0),
 		deleted: files.reduce((total, file) => total + file.deleted, 0),
+		digest: changesDigest({ files, added: 0, deleted: 0 }),
 	};
 }
+
+// The footer Status memo asks "did any change move?" on every keystroke, so
+// the answer must be O(1) to read: the model stores this digest once per
+// build (changesModel/emptyChanges) and consumers read the stored field.
+// It is a 64-bit FNV-1a roll over every per-file tuple the renderer consumes
+// (path, status, counts, diffRevision, countsUnavailable), so counts alone
+// cannot miss a same-count edit. A hash collision could only skip one
+// refresh until the next change moves the digest again -- it never renders a
+// wrong picture -- but it is a probabilistic signal, not an exact one.
+function fnv1a(hash: number, text: string): number {
+	for (let index = 0; index < text.length; index += 1) {
+		hash ^= text.charCodeAt(index);
+		hash = Math.imul(hash, 0x01000193);
+	}
+	return hash >>> 0;
+}
+
+const FNV_OFFSET_BASIS = 0x811c9dc5;
+const SECOND_SEED = 0x811c9dc5 ^ 0x9e3779b9;
+
+export function changesDigest(model: ChangesModel): string {
+	let first = FNV_OFFSET_BASIS;
+	let second = SECOND_SEED;
+	for (const file of model.files) {
+		const tuple = `\u0000${file.path}\u0000${file.status}\u0000${file.added}\u0000${file.deleted}\u0000${file.diffRevision ?? ""}\u0000${file.countsUnavailable ?? ""}`;
+		first = fnv1a(first, tuple);
+		second = fnv1a(second, tuple);
+	}
+	return `${first.toString(16).padStart(8, "0")}${second.toString(16).padStart(8, "0")}`;
+}
+
+const EMPTY_CHANGES_DIGEST = changesDigest({ files: [], added: 0, deleted: 0 });
 
 export function changesSummary(model: ChangesModel): string {
 	const noun = model.files.length === 1 ? "file" : "files";

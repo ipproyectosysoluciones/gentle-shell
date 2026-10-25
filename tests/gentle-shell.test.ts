@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test, { after, afterEach } from "node:test";
+import test, { after, afterEach, type TestContext } from "node:test";
 import { initTheme, type ExtensionAPI, type ExtensionContext, type SlashCommandInfo, type SourceInfo } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, matchesKey, stripTerminalSequences as stripAnsi, TuiMainScreen, visibleWidth, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import installGentleShell, { backgroundChangeRefreshesSettled, buildShellBarModel, createActiveProfileReader, changesShortcut, devBinaryCard, extractQueuedText, fetchCodexUsage, fetchNanUsage, loadFileDiff, shellGitRunner, openInExternalEditor, usageShortcut, GentlePromptEditor } from "../extensions/gentle-shell.ts";
@@ -2051,7 +2051,7 @@ test("gentleShell shows working while the agent runs and queued when messages wa
 	const editor = installedPrompt(ctx, ui, handlers);
 
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
-	assert.match(stripAnsi(editor.render(60)[0]), /^╭─ ✿ working… ─+╮$/);
+	assert.match(stripAnsi(editor.render(60)[0]), /^╭─ [✿❀❁✾] working… ─+╮$/);
 	pending.value = true;
 	assert.match(stripAnsi(editor.render(60)[0]), /^╭─ [✿❀❁✾] queued ─+╮$/);
 	for (const handler of handlers.get("agent_end") ?? []) handler({}, ctx);
@@ -2824,7 +2824,7 @@ test("vim selector exposes enable, disable and status; status and cancellation d
  } finally { editor.dispose(); }
 });
 
-test("animations command reports without writing and switches the live pulse", async (t) => {
+test("animations command reports without writing and switches the live watchdog", async (t) => {
 	const configHome = scopedDoubleEscCancelConfigHome(t);
 	const delays: number[] = [];
 	let active = 0;
@@ -2842,9 +2842,9 @@ test("animations command reports without writing and switches the live pulse", a
 	assert.match(ui.notices.at(-1)!, /animations: quality/);
 	assert.equal(existsSync(join(configHome, "animations.json")), false);
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
-	assert.deepEqual(delays, [2000, 80]);
+	assert.deepEqual(delays, [2000, 1000]);
 	await command.handler("performance", ctx);
-	assert.deepEqual(delays, [2000, 80, 1000]);
+	assert.deepEqual(delays, [2000, 1000, 1000]);
 	assert.equal(active, 2);
 	await command.handler("potato", ctx);
 	assert.equal(active, 1);
@@ -2853,7 +2853,7 @@ test("animations command reports without writing and switches the live pulse", a
 	await command.handler("invalid", ctx);
 	assert.equal(JSON.parse(readFileSync(join(configHome, "animations.json"), "utf8")).policy, "potato");
 	await command.handler("quality", ctx);
-	assert.deepEqual(delays, [2000, 80, 1000, 80]);
+	assert.deepEqual(delays, [2000, 1000, 1000, 1000]);
 	for (const handler of handlers.get("agent_settled") ?? []) handler({}, ctx);
 	assert.equal(active, 1);
 	editor.dispose();
@@ -2942,7 +2942,7 @@ test("animations with no argument opens a selectable menu and applies the chosen
 	assert.equal(existsSync(join(dismissHome, "animations.json")), false);
 });
 
-test("prompt uses the compact banner cadence and releases its unref timer at settlement", async (t) => {
+test("prompt installs the silence watchdog unref'd and releases it at settlement", async (t) => {
 	const configHome = scopedDoubleEscCancelConfigHome(t);
 	writeFileSync(join(configHome, "animations.json"), '{"schema":"gentle-pi.animations/v1","policy":"quality"}');
 	const delays: number[] = [];
@@ -2960,13 +2960,116 @@ test("prompt uses the compact banner cadence and releases its unref timer at set
 	const editor = installedPrompt(ctx, ui, handlers);
 	assert.equal(active, 1);
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
-	assert.deepEqual(delays, [2000, 80]);
+	assert.deepEqual(delays, [2000, 1000]);
 	assert.equal(unrefs, 2);
 	for (const handler of handlers.get("agent_settled") ?? []) handler({}, ctx);
 	assert.equal(active, 1);
 	editor.dispose();
 	await fire(handlers, "session_shutdown", ctx);
 	assert.equal(active, 0);
+});
+
+// gentle-shell#994: the working animation is render-driven. Frames the host
+// already paints while streaming advance the petal for free; a low-cadence
+// watchdog repaints only silent phases (long tool runs with no output).
+interface RecordedInterval { tick: () => void; delay: number; stopped: boolean }
+
+function recordIntervals(t: TestContext): RecordedInterval[] {
+	const intervals: RecordedInterval[] = [];
+	t.mock.method(globalThis, "setInterval", (tick: () => void, delay: number) => {
+		const timer: RecordedInterval = { tick, delay, stopped: false };
+		intervals.push(timer);
+		return { unref() {}, timer };
+	});
+	t.mock.method(globalThis, "clearInterval", (handle: { timer: RecordedInterval }) => { handle.timer.stopped = true; });
+	return intervals;
+}
+
+function petalGlyphOf(editor: GentlePromptEditor): string {
+	return stripAnsi(editor.render(60)[0]).match(/[✿❀❁✾]/)?.[0] ?? "";
+}
+
+test("streaming frames advance the working petal and the quality watchdog stays silent while renders flow", (t) => {
+	const configHome = scopedDoubleEscCancelConfigHome(t);
+	writeFileSync(join(configHome, "animations.json"), '{"schema":"gentle-pi.animations/v1","policy":"quality"}');
+	const intervals = recordIntervals(t);
+	const renders = t.mock.method(fakeTui, "requestRender", () => {});
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: configHome }, { now: () => 1_000_000 });
+	const { ctx, ui } = fakeContext();
+	const editor = installedPrompt(ctx, ui, handlers);
+	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
+	const watchdog = intervals.find((entry) => entry.delay === 1000);
+	assert.ok(watchdog, "working installs the 1000ms silence watchdog");
+	const glyphs = [0, 1, 2, 3].map(() => petalGlyphOf(editor));
+	assert.ok(new Set(glyphs).size > 1, `each streamed frame must advance the petal, got ${glyphs.join("")}`);
+	const before = renders.mock.callCount();
+	watchdog!.tick();
+	assert.equal(renders.mock.callCount(), before, "renders are already flowing, so the watchdog must not force one");
+	editor.dispose();
+	assert.equal(watchdog!.stopped, true);
+});
+
+test("silent working phases repaint only through the 1000ms watchdog window", (t) => {
+	const configHome = scopedDoubleEscCancelConfigHome(t);
+	writeFileSync(join(configHome, "animations.json"), '{"schema":"gentle-pi.animations/v1","policy":"quality"}');
+	const intervals = recordIntervals(t);
+	const renders = t.mock.method(fakeTui, "requestRender", () => {});
+	let clock = 1_000_000;
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: configHome }, { now: () => clock });
+	const { ctx, ui } = fakeContext();
+	const editor = installedPrompt(ctx, ui, handlers);
+	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
+	const watchdog = intervals.find((entry) => entry.delay === 1000);
+	assert.ok(watchdog, "working installs the 1000ms silence watchdog");
+	const baseline = petalGlyphOf(editor);
+	const before = renders.mock.callCount();
+	watchdog!.tick();
+	assert.equal(renders.mock.callCount(), before, "no frame painted within the window, but the window has not elapsed yet");
+	clock += 1000;
+	watchdog!.tick();
+	assert.equal(renders.mock.callCount(), before + 1, "silence past the window forces exactly one repaint");
+	assert.notEqual(petalGlyphOf(editor), baseline, "the watchdog advanced the petal tick");
+	const afterForced = renders.mock.callCount();
+	watchdog!.tick();
+	assert.equal(renders.mock.callCount(), afterForced, "the watchdog's own repaint counts as render traffic for the next window");
+	editor.dispose();
+});
+
+test("potato installs no working watchdog and the petal never advances", (t) => {
+	const configHome = scopedDoubleEscCancelConfigHome(t);
+	writeFileSync(join(configHome, "animations.json"), '{"schema":"gentle-pi.animations/v1","policy":"potato"}');
+	const intervals = recordIntervals(t);
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: configHome });
+	const { ctx, ui } = fakeContext();
+	const editor = installedPrompt(ctx, ui, handlers);
+	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
+	assert.ok(!intervals.some((entry) => entry.delay !== 2000), "potato must not animate: no watchdog interval at all");
+	const glyphs = [0, 1, 2].map(() => petalGlyphOf(editor));
+	assert.deepEqual(glyphs, ["✿", "✿", "✿"], "potato keeps the petal static");
+	editor.dispose();
+});
+
+test("the working watchdog is cleared on settlement and on dispose", (t) => {
+	const configHome = scopedDoubleEscCancelConfigHome(t);
+	writeFileSync(join(configHome, "animations.json"), '{"schema":"gentle-pi.animations/v1","policy":"quality"}');
+	const intervals = recordIntervals(t);
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: configHome });
+	const { ctx, ui } = fakeContext();
+	const editor = installedPrompt(ctx, ui, handlers);
+	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
+	const watchdog = intervals.filter((entry) => entry.delay === 1000).at(-1);
+	assert.ok(watchdog && !watchdog.stopped, "working keeps the watchdog armed");
+	for (const handler of handlers.get("agent_settled") ?? []) handler({}, ctx);
+	assert.equal(watchdog!.stopped, true, "settlement must clear the watchdog");
+	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
+	const rearmWatchdog = intervals.filter((entry) => entry.delay === 1000).at(-1);
+	assert.ok(rearmWatchdog && rearmWatchdog !== watchdog && !rearmWatchdog.stopped, "the next turn re-arms a fresh watchdog");
+	editor.dispose();
+	assert.equal(rearmWatchdog!.stopped, true, "dispose must clear the watchdog");
 });
 
 // ---------------------------------------------------------------------------

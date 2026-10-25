@@ -12,7 +12,7 @@ import { resolveSessionProfile, sessionProfileLabel, sessionProfileModelProfiles
 import * as os from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { buildShellHeaderModel, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellSidebarBar, keepNativeWorkingRow, shellEnabled, shellHeaderUsageHit, shellJobsCount, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
-import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, WorktreeChangesTracker, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
+import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, WorktreeChangesTracker, changesDigest, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
 import { SessionWorktreeRegistry, resolveSessionWorktree, worktreeGitEnvironment, type WorktreeResolver, type WorktreeIdentity } from "../lib/session-worktree-registry.ts";
@@ -31,7 +31,7 @@ import { DEFAULT_VISUAL_SETTINGS, DENSITY, HEADER_PLACEMENT, STATUS_PLACEMENT, V
 import { BANNER_COLORS, DEFAULT_BANNER_CONFIG, readBannerConfig, readBannerConfigForEdit, writeBannerConfig } from "./startup-banner.ts";
 import { agentsViewKey } from "../lib/agents-keys.ts";
 import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
-import { DOUBLE_ESC_CANCEL_HINT, floatPromptRow, framePromptLines, resolvePromptLayout, IDLE_ESC_CLEAR_HINT, PROMPT_HINT, PROMPT_STATE, SHELL_PULSE_MS, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
+import { DOUBLE_ESC_CANCEL_HINT, floatPromptRow, framePromptLines, resolvePromptLayout, IDLE_ESC_CLEAR_HINT, PROMPT_HINT, PROMPT_STATE, SHELL_PULSE_WATCHDOG_MS, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
 import { oddPhaseRegistry } from "../lib/odd-phase.ts";
 import { inferOddPhase } from "../lib/odd-phase-inference.ts";
 import { isInteractiveMode } from "../lib/rpc-host.ts";
@@ -473,6 +473,8 @@ interface PromptEditorDeps {
 	/** Pasted images become atomic `[Image#N]` chips; absent, Pi's paste handler runs unchanged. */
 	attachments?: ImageAttachments;
 	readClipboardImage?: () => Promise<ClipboardImage | null>;
+	/** Injectable silence-watchdog window; production and tests default to SHELL_PULSE_WATCHDOG_MS. */
+	watchdogMs?: number;
 }
 
 const PROMPT_FRAME_ROLE = "border";
@@ -527,7 +529,10 @@ export class GentlePromptEditor extends CustomEditor {
 	private visualReplacePending = false;
 	private visualObjectPending: "i" | "a" | undefined;
 	private visualAnchor: { line: number; col: number } | undefined;
-	private pulse: NodeJS.Timeout | undefined;
+	private watchdog: NodeJS.Timeout | undefined;
+	// Last time a frame painted (or the watchdog forced one) while working; the
+	// quality watchdog repaints only when now() drifts past its window.
+	private lastRenderAt = 0;
 	private readonly deps: PromptEditorDeps;
 	private floatMouseLayout?: ReturnType<typeof resolvePromptLayout>;
 	// Native selection engine (shift+home/end, alt+a, replace-on-key): ported
@@ -634,8 +639,8 @@ export class GentlePromptEditor extends CustomEditor {
 	setAnimationPolicy(policy: AnimationPolicy): void {
 		if (this.animationPolicy === policy) return;
 		this.animationPolicy = policy;
-		this.stopPulse();
-		if (this.promptState === PROMPT_STATE.WORKING) this.startPulse();
+		this.stopWatchdog();
+		if (this.promptState === PROMPT_STATE.WORKING) this.startWatchdog();
 		this.deps.requestRender();
 	}
 
@@ -720,24 +725,32 @@ export class GentlePromptEditor extends CustomEditor {
 		this.deps.requestRender();
 	}
 
-	private startPulse(): void {
+	private startWatchdog(): void {
 		if (this.animationPolicy === "potato") return;
-		this.pulse = setInterval(() => {
+		const windowMs = this.deps.watchdogMs ?? SHELL_PULSE_WATCHDOG_MS;
+		this.lastRenderAt = this.deps.now();
+		this.watchdog = setInterval(() => {
+			// Render-driven petal (gentle-shell#994): streaming frames already
+			// advance the animation in render(), so under quality the watchdog
+			// stays silent unless no frame painted within its window. performance
+			// keeps its coarse cadence regardless of render traffic.
+			if (this.animationPolicy === "quality" && this.deps.now() - this.lastRenderAt < windowMs) return;
 			this.tick += 1;
+			this.lastRenderAt = this.deps.now();
 			this.deps.requestRender();
-		}, this.animationPolicy === "performance" ? 1000 : SHELL_PULSE_MS);
-		this.pulse.unref();
+		}, windowMs);
+		this.watchdog.unref();
 	}
 
 	setWorking(working: boolean): void {
 		this.promptState = working ? PROMPT_STATE.WORKING : PROMPT_STATE.IDLE;
-		this.stopPulse();
+		this.stopWatchdog();
 		if (!working) {
 			this.pendingEscapeCancelDeadline = undefined;
 		} else {
 			this.pendingIdleClearDeadline = undefined;
 			this.pendingIdleClearText = undefined;
-			this.startPulse();
+			this.startWatchdog();
 		}
 		this.deps.requestRender();
 	}
@@ -1224,6 +1237,13 @@ export class GentlePromptEditor extends CustomEditor {
 	}
 
 	render(width: number): string[] {
+		// Render-driven petal (gentle-shell#994): every frame the host already
+		// paints while working advances the animation for free, so no fast
+		// timer forces renders during streaming.
+		if (this.promptState === PROMPT_STATE.WORKING && this.animationPolicy === "quality") {
+			this.tick += 1;
+			this.lastRenderAt = this.deps.now();
+		}
 		const layout = resolvePromptLayout(width, cardStyle(), this.deps.bg);
 		this.floatMouseLayout = layout.background ? layout : undefined;
 		const inner = layout.nativeWidth;
@@ -1288,7 +1308,7 @@ export class GentlePromptEditor extends CustomEditor {
 
 	dispose(): void {
 		this.disposed = true;
-		this.stopPulse();
+		this.stopWatchdog();
 	}
 
 	private isPendingEscapeCancel(): boolean {
@@ -1303,9 +1323,9 @@ export class GentlePromptEditor extends CustomEditor {
 		);
 	}
 
-	private stopPulse(): void {
-		if (this.pulse) clearInterval(this.pulse);
-		this.pulse = undefined;
+	private stopWatchdog(): void {
+		if (this.watchdog) clearInterval(this.watchdog);
+		this.watchdog = undefined;
 		this.tick = 0;
 	}
 }
@@ -1388,7 +1408,7 @@ function installPrompt(
 		});
 		// Pi's own docs require an explicit requestRender() after a state change
 		// (docs/tui.md: "Call tui.requestRender() after state changes"); no host
-		// re-render is implicitly guaranteed, and the WORKING pulse loop does not
+		// re-render is implicitly guaranteed, and the WORKING watchdog does not
 		// run at all under the "potato" animation policy. Register this session's
 		// redraw so a phase reported by the tool is visible immediately.
 		oddPhaseRegistry.setRenderRequest(ctx.sessionManager.getSessionId(), () => tui.requestRender());
@@ -1537,8 +1557,11 @@ function changesPollMs(env: NodeJS.ProcessEnv): number {
 const USAGE_FETCH_TIMEOUT_DEFAULT_MS = 10_000;
 const usageFetchTimeoutMs = (env: NodeJS.ProcessEnv): number => positiveMs(env.GENTLE_PI_SHELL_USAGE_TIMEOUT_MS, USAGE_FETCH_TIMEOUT_DEFAULT_MS);
 
+// The footer memo reads this every keystroke: tracker models store the
+// digest once per scan (lib/shell-changes.ts), so this is O(1); hand-built
+// models without a stored digest fall back to computing it here.
 function changesFingerprint(model: ChangesModel): string {
-	return model.files.map((file) => `${file.path}:${file.status}:${file.added}:${file.deleted}:${file.diffRevision ?? ""}:${file.countsUnavailable ?? ""}`).join("|");
+	return model.digest ?? changesDigest(model);
 }
 
 interface OverlayDeps {
