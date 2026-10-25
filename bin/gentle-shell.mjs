@@ -101,7 +101,7 @@ import { bundledGentleAiPaths, GENTLE_AI_VERSION, gentleAiBinaryPath, gentleAiIs
 import { DEFAULT_THEME_NAME, installIsolatedTuiModeSetting } from "../scripts/install-tui-mode-setting.mjs";
 import { artifactFor, engramPinVersion } from "../scripts/installer-downloads.mjs";
 import { migrateBundledEngram, migrationPending, MIGRATION_PENDING_NOTICE, MIGRATION_USAGE } from "../scripts/bundled-engram-migration.mjs";
-import { shouldCheckStartupUpdate, findStartupUpdate } from "../runtime/gentle-shell-startup-update.mjs";
+import { findStartupUpdate, parseStartupReleaseCache, shouldCheckStartupUpdate, writeStartupReleaseCache } from "../runtime/gentle-shell-startup-update.mjs";
 import { promptStartupUpdate } from "../runtime/gentle-shell-update-panel.mjs";
 import { applyStartupChoice, omitStartupVersion, resolveStartupRelaunch } from "../runtime/gentle-shell-startup-flow.mjs";
 
@@ -1782,11 +1782,27 @@ async function startupUpdate(bundled, args, startupEnv) {
 	if (!shouldCheckStartupUpdate({ args, env: startupEnv, bundled: Boolean(bundled),
 		inputTTY: process.stdin.isTTY === true, outputTTY: process.stdout.isTTY === true })) return undefined;
 	const configPath = resolveConfigPath();
-	let skipped;
-	try { skipped = readRawConfig(configPath).skippedStartupRelease; } catch { /* A notice must not prevent opening. */ }
+	let skipped, cache;
+	try {
+		const raw = readRawConfig(configPath);
+		skipped = raw.skippedStartupRelease;
+		// The last recorded lookup answers today's check without the network; a
+		// stale or malformed record just means this launch looks again.
+		cache = parseStartupReleaseCache(raw.startupReleaseCheck);
+	} catch { /* A notice must not prevent opening. */ }
 	const { latestRelease } = await import("../scripts/main-channel.mjs");
-	const offer = await findStartupUpdate({ current: ownPackageVersion(), skipped,
-		lookup: (signal) => latestRelease((url, options) => fetch(url, { ...options, signal })) });
+	const offer = await findStartupUpdate({ current: ownPackageVersion(), skipped, cache,
+		lookup: (signal) => latestRelease((url, options) => fetch(url, { ...options, signal })),
+		// Only a live lookup reaches this: persisting it keeps the next launches
+		// off the network. A failed write is retried by tomorrow's stale cache.
+		cacheWrite: (latest) => {
+			try {
+				writeStartupReleaseCache(() => readJsonIfExists(configPath), (text) => {
+					mkdirSync(dirname(configPath), { recursive: true, mode: 0o700 });
+					writeFileAtomically(configPath, text, { mode: 0o600 });
+				}, latest);
+			} catch { /* A notice must not prevent opening. */ }
+		}, });
 	if (!offer) return undefined;
 	let choice;
 	try { choice = await promptStartupUpdate(offer, { color: process.stdout.hasColors?.() === true }); }
