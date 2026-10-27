@@ -24,6 +24,7 @@ import type { ShellBarTheme } from "../lib/shell-bar.ts";
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import { decodeReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { REVIEW_SIDEBAR_EVENT } from "../lib/review-sidebar-state.ts";
+import { isJobsSidebarSnapshot } from "../lib/jobs-sidebar-state.ts";
 import type { NativeReviewCli } from "../lib/native-review-cli.ts";
 import { resolveVisualSettings, writeVisualSettings } from "../lib/visual-customization-policy.ts";
 import { resolveAnimationPolicy } from "../lib/animation-policy.ts";
@@ -503,7 +504,7 @@ test("review sidebar rejects foreign-session events and unsubscribes on shutdown
 	}
 });
 
-test("jobs snapshots populate Status, use one compact fallback, and reject stale sessions", async () => {
+test("jobs snapshots feed their own rail card, keep one compact fallback, and reject stale sessions", async () => {
 	const { pi, handlers } = fakePi();
 	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
 	const { ctx, ui } = fakeContext();
@@ -515,33 +516,54 @@ test("jobs snapshots populate Status, use one compact fallback, and reject stale
 	const component = factory(tui, plainTheme, data);
 	const state = sidebarState(tui as unknown as TUI);
 	const rail = state.parts.get("footer")!;
+	const jobs = state.parts.get("jobs")!;
 	const header = state.parts.get("header")!;
 	const publish = (sessionId: string, jobs: unknown) => pi.events.emit("gentle-ai:jobs-sidebar", { sessionId, snapshot: { jobs } });
 	try {
 		publish("shell-session", [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }]);
-		assert.match(rail.render(46).join("\n"), /Jobs[\s\S]*CI for PR 1860/);
+		assert.doesNotMatch(rail.render(46).join("\n"), /Jobs|CI for PR 1860/, "the Status card never prints jobs; the jobs card owns them");
 		assert.match(rail.render(46).join("\n"), /MCP: 3 servers/);
-		assert.doesNotMatch(rail.render(46).join("\n"), /1 job/, "Jobs replaces the generic integration counter");
+		assert.match(jobs.render(46).join("\n"), /Jobs[\s\S]*CI for PR 1860/);
+		publish("shell-session", [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }, { id: "job-0", label: "Build runtime", startedAt: 1, status: "exited", endedAt: Date.now(), exitCode: 0 }]);
+		assert.match(jobs.render(60).join("\n"), /1 running · 1 finished/, "finished tails ride the same snapshot");
+		assert.match(jobs.render(60).join("\n"), /✓\s+Build runtime/);
+		// The compact count is running-only: a finished tail still paints the
+		// card, but the header's ⧗ N jobs derives from running entries alone.
+		publish("shell-session", [{ id: "job-2", label: "Fresh tail", startedAt: 1, status: "exited", endedAt: Date.now(), exitCode: 0 }]);
+		tui.terminal.columns = 80;
+		assert.match(jobs.render(46).join("\n"), /Fresh tail/, "the finished tail still paints the card");
+		assert.doesNotMatch(header.render(80).join("\n"), /⧗ 1 job/, "the compact count is running-only");
+		tui.terminal.columns = 160;
+		publish("shell-session", [{ id: "job-0", label: "Stale tail", startedAt: 1, status: "exited", endedAt: 5, exitCode: 0 }]);
+		assert.doesNotMatch(jobs.render(46).join("\n"), /Stale tail/, "a finished job past the TTL paints nothing");
+		assert.doesNotMatch(rail.render(46).join("\n"), /1 job/, "the jobs counter never joins the integration statuses while display data exists");
 		state.active = true;
 		state.ownsHost = () => true;
-		assert.doesNotMatch(header.render(160).join("\n"), /1 job/, "the visible Status card owns jobs details");
+		assert.doesNotMatch(header.render(160).join("\n"), /1 job/, "the visible rail owns job details");
 		state.active = false;
 		tui.terminal.columns = 80;
-		assert.match(header.render(80).join("\n"), /1 job/, "mobile topbar preserves the count");
-		const before = rail.digest?.();
+		publish("shell-session", [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }]);
+		assert.match(header.render(80).join("\n"), /1 job/, "mobile topbar preserves the count of a running job");
+		const before = jobs.render(46).join("\n");
 		publish("foreign", []);
 		publish("shell-session", [{ label: "invalid" }]);
-		assert.equal(rail.digest?.(), before);
+		assert.equal(jobs.render(46).join("\n"), before);
 		publish("shell-session", []);
-		assert.doesNotMatch(rail.render(46).join("\n"), /Jobs|CI for PR/);
+		assert.doesNotMatch(jobs.render(46).join("\n"), /Jobs|CI for PR/);
 		assert.doesNotMatch(header.render(80).join("\n"), /1 job/);
 		publish("shell-session", [{ id: "job-2", label: "Build runtime", startedAt: 2 }]);
 		await fire(handlers, "session_start", ctx);
-		assert.doesNotMatch(rail.render(46).join("\n"), /Build runtime/);
+		assert.doesNotMatch(state.parts.get("jobs")!.render(46).join("\n"), /Build runtime/);
 		await fire(handlers, "session_shutdown", ctx);
 		publish("shell-session", [{ id: "job-3", label: "late", startedAt: 3 }]);
-		assert.doesNotMatch(rail.render(46).join("\n"), /late/);
+		assert.doesNotMatch(state.parts.get("jobs")!.render(46).join("\n"), /late/);
 	} finally { component.dispose(); }
+});
+
+test("the jobs snapshot validator admits the finished-tail statuses", () => {
+	assert.ok(isJobsSidebarSnapshot({ jobs: [{ id: "job-1", label: "Spawn failed", startedAt: 1, status: "failed", endedAt: 60_000, exitCode: null }] }));
+	assert.ok(isJobsSidebarSnapshot({ jobs: [{ id: "job-2", label: "Stopped", startedAt: 1, status: "stopped", endedAt: 2 }] }));
+	assert.equal(isJobsSidebarSnapshot({ jobs: [{ id: "job-3", label: "Bad", startedAt: 1, status: "exploded" }] }), false);
 });
 
 test("hidden Status leaves only a jobs count in regular bottom and fullscreen header chrome", async (t) => {
@@ -559,6 +581,9 @@ test("hidden Status leaves only a jobs count in regular bottom and fullscreen he
 		pi.events.emit("gentle-ai:jobs-sidebar", { sessionId: "shell-session", snapshot: { jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }] } });
 		assert.equal(component.render(80).join("\n"), "⧗ 1 job");
 		assert.doesNotMatch(component.render(80).join("\n"), /CI for PR|gpt-5/);
+		pi.events.emit("gentle-ai:jobs-sidebar", { sessionId: "shell-session", snapshot: { jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1, status: "exited", endedAt: Date.now(), exitCode: 0 }] } });
+		assert.doesNotMatch(component.render(80).join("\n"), /⧗/, "a finished-only tail never paints a ⧗ 0 jobs row");
+		pi.events.emit("gentle-ai:jobs-sidebar", { sessionId: "shell-session", snapshot: { jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }] } });
 		tui.mode = "fullscreen";
 		const header = sidebarState(tui as unknown as TUI).parts.get("header")!;
 		assert.match(header.render(160).join("\n"), /⧗ 1 job/);

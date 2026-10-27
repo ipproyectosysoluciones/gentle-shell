@@ -19,6 +19,7 @@ import { createJobRegistry, isStandaloneSleep, type JobExecOperations, type JobR
 import { JOB_GLYPH, JOB_NOTICE_TYPE, jobDetails, jobNoticeText, monitorEventsText, monitorStoppedText, registerBackgroundJobTools } from "../lib/background-jobs-tools.ts";
 import { createMonitorController, mergeMonitorBatches, type MonitorNotice } from "../lib/background-monitor.ts";
 import { JobsView } from "../lib/jobs-view.ts";
+import { JOBS_FINISHED_TTL_MS } from "../lib/jobs-widget.ts";
 import { JOBS_SIDEBAR_EVENT, JOBS_STATUS_KEY } from "../lib/jobs-sidebar-state.ts";
 import { Text, type Component, type TUI } from "@earendil-works/pi-tui";
 import { invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
@@ -1231,11 +1232,22 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	// Structured descriptions feed Status; native hosts keep the compact count.
 	const refreshJobStatus = () => {
 		const sessionId = activeSessionId();
-		const running = jobs.list(sessionId ?? "").filter((job) => job.status === "running")
+		const sessionJobs = jobs.list(sessionId ?? "");
+		const running = sessionJobs.filter((job) => job.status === "running")
 			.sort((a, b) => b.startedAt - a.startedAt);
+		// Finished tails ride the same snapshot so the sidebar card can linger
+		// them briefly, like the Agents card's results; failed jobs ride too,
+		// painting the ✗ glyph like a nonzero exit.
+		const finished = sessionJobs.filter((job) => (job.status === "exited" || job.status === "stopped" || job.status === "failed") && job.endedAt !== undefined && deps.now() - job.endedAt < JOBS_FINISHED_TTL_MS)
+			.sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0)).slice(0, 3);
 		try { parentCtx?.ui.setStatus(JOBS_STATUS_KEY, running.length === 0 ? undefined : `${JOB_GLYPH} ${running.length} job${running.length === 1 ? "" : "s"}`); } catch { /* Status is cosmetic. */ }
 		if (sessionId) {
-			try { pi.events.emit(JOBS_SIDEBAR_EVENT, { sessionId, snapshot: { jobs: running.map(({ id, label, startedAt }) => ({ id, label, startedAt })) } }); } catch { /* Display only. */ }
+			try {
+				pi.events.emit(JOBS_SIDEBAR_EVENT, { sessionId, snapshot: { jobs: [
+					...running.map(({ id, label, startedAt }) => ({ id, label, startedAt })),
+					...finished.map(({ id, label, startedAt, status, endedAt, exitCode }) => ({ id, label, startedAt, status, endedAt, exitCode })),
+				] } });
+			} catch { /* Display only. */ }
 		}
 	};
 
