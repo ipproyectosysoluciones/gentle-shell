@@ -222,7 +222,7 @@ This checkout declares `gentle-pi` `4.0.0` with a package-local Gentle AI `v4.3.
 
 ### Pi compatibility
 
-The current package requires Pi 1.2.0 or newer and Node >=22.19.0. Development tests resolve Pi through the open `>=1.0.0` development range. The private Vim editor adapter admits only the audited Pi `0.99.1`, `0.99.2`, `1.0.0`, `1.1.0`, and `1.2.0` releases; any other release keeps ordinary prompt editing until its editor is audited. Use the latest Pi release; gentle-pi does not update your installed Pi automatically. Children, including any `GENTLE_PI_AGENTS_PI` override, must emit `agent_settled`: `agent_end` records a run's output but is not completion because retries or queued continuations may follow.
+The current package requires Pi 1.2.0 or newer and Node >=22.19.0. Development tests resolve Pi through the open `>=1.0.0` development range. The private Vim editor adapter admits only the audited Pi `0.99.1`, `0.99.2`, `1.0.0`, `1.1.0`, `1.2.0`, `1.3.0`, and `1.4.0` releases; any other release keeps ordinary prompt editing until its editor is audited. Use the latest Pi release; gentle-pi does not update your installed Pi automatically. Children, including any `GENTLE_PI_AGENTS_PI` override, must emit `agent_settled`: `agent_end` records a run's output but is not completion because retries or queued continuations may follow.
 
 The [`v2.6.0` release](https://github.com/Gentleman-Programming/gentle-shell/releases/tag/v2.6.0) added persistent registered worktrees and grouped `/gentle:changes` views; fuller workspace interaction details are in the [Gentle Shell reference](gentle-shell.md). It also adds named atomic `/gentle:profiles`, native review intended-untracked selection and provider continuations, and opt-in custom ask responses. Pi recognizes its global Git-managed package path; subsystems install with explicit recovery guidance when npm lifecycle work was skipped. Windows keeps child consoles hidden and fixes ownership mode; Gentle Todo keeps the next pending task visible when collapsed.
 
@@ -304,6 +304,7 @@ gentle-shell home [link|isolated|<path>]
 gentle-shell [home selectors] setup [--dry-run]
 gentle-shell upgrade [--channel release|main]
 gentle-shell upgrade --rollback
+gentle-shell update [pi|self|--self|--all] --latest
 gentle-shell self-uninstall [--dry-run] [--yes] [--include-shared]
 ```
 
@@ -382,7 +383,7 @@ Tradeoff: `--link` shares one credential store with pi; `import-pi` duplicates i
 
 After a successful install, Shell reads the supplied Pi version back from a fresh global listing and reports it, naming the previous version when it changed. An unchanged pnpm result also names pnpm's `minimumReleaseAge` setting: pnpm installs only releases older than that age (pnpm 11 defaults to 4320 minutes), so a very recent Pi release is picked up once it is old enough; Shell reports the rule rather than overriding it. Both the listing and the install run from the system temporary directory, so a project's `packageManager` pin in the current directory never changes which pnpm answers. When the version cannot be read back, the output says so and points at `gentle-shell --version`.
 
-Prefix-bundled installations keep their existing `gentle-shell upgrade` route for Pi. `update --all` updates the verified owner before forwarding extension updates; an ownership refusal stops without mutation. Shell's `upgrade` and `self-uninstall` ownership behavior is unchanged.
+Prefix-bundled installations keep their existing `gentle-shell upgrade` route for Pi, or `gentle-shell update --latest` for the newest published Pi without the release's verified lockfile (see [`upgrade`](#upgrade-subcommand-and-channels)). Outside a bundled install `--latest` changes nothing: `update` already installs the latest Pi. `update --all` updates the verified owner before forwarding extension updates; an ownership refusal stops without mutation. Shell's `upgrade` and `self-uninstall` ownership behavior is unchanged.
 
 ### `setup` subcommand
 
@@ -555,6 +556,7 @@ every `update` form that updates Pi itself explains that and runs
 `gentle-shell upgrade` (in a terminal) or names it. Those forms are no target,
 `--self`, `self` or `pi`, `--all`, and `self` or `pi` with `--extensions`. The
 extension part of an "all" form, and every package update, still reaches Pi.
+`gentle-shell update --latest` (also with `pi`, `self`, `--self` or `--all`) installs the newest published stable Pi with the active Gentle Shell instead, without the release's verified lockfile: it first warns that Gentle Shell features relying on audited Pi internals (such as the Vim editor) may turn off until a Gentle Shell release verifies that Pi, then verifies and switches to it like `upgrade`, keeping the previous version for `gentle-shell upgrade --rollback`. Afterwards `gentle-shell upgrade` never downgrades that Pi: a release of the same Gentle Shell with an older verified Pi changes nothing, and a newer Gentle Shell release upgrades as usual. When the active Pi is already newer than the published `latest` (the dist-tag moved back), `--latest` changes nothing. Outside a bundled install, `gentle-shell update --latest` is the ordinary managed Pi update, which already installs the newest published Pi.
 In a bundled install Pi and the agent's commands keep your own environment;
 Pi installs packages with Gentle Shell's npm through the `npmCommand` setting
 of its own home. Details: [Bundled install](bundled-install.md#launcher-in-a-bundled-install).
@@ -657,8 +659,7 @@ Synthetic tests prove the observer's behavior, not the cause of issue #213. A ne
 ```text
 /gentle:status          Check package assets and global model config.
 /gentle:doctor          Run read-only diagnostics for assets, config, tools, guards, and Herdr setup.
-/gentle:models             Open the models screen on this repository's profile. Subcommands: export, restore.
-/gentle:profiles           Open the same models screen. Subcommands: export <name>, import, publish <name>.
+/gentle:profiles           Open the models screen on this repository's profile. Subcommands: export <name>, import, publish <name>, export-routing, restore-routing.
 /gentle:persona            Switch between gentleman and neutral persona modes.
 /gentle:background-subagents  Show or set the managed background-subagents policy, with its deciding source.
 /gentle:review-mode          Show or set the receipt-driven development mode (status|enable|disable).
@@ -1006,10 +1007,10 @@ A project can still override the global default with:
 ## Model and effort assignment
 
 ```text
-/gentle:models
+/gentle:profiles
 ```
 
-`/gentle:models` and `/gentle:profiles` open the same screen: one table, with your profiles as tabs across the top.
+`/gentle:profiles` opens the models screen on the profile this repository resolves: one table, with your profiles as tabs across the top. It replaces the retired `/gentle:models`, which opened the same screen.
 
 ```text
 ╭──────────────────────────────────────────────────────────────────────────────╮
@@ -1027,7 +1028,7 @@ A project can still override the global default with:
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
-- **Tabs are profiles.** Click a tab or press `←` `→` to show another one. Symbols show where a profile is in effect: `◉` this session, `★` the default for new sessions, `⌂` this repository. Leaving a profile with unsaved changes asks first: **Save and switch**, **Discard**, or **Stay**.
+- **Tabs are profiles.** Click a tab or press `←` `→` to show another one; the screen redraws in place. Symbols show where a profile is in effect: `◉` this session, `★` the default for new sessions, `⌂` this repository. Leaving a profile with unsaved changes asks first: **Save and switch**, **Discard**, or **Stay**.
 - **The table is that profile's routing.** The orchestrator is the first row; agents follow. Click a model or press `enter` to choose from a searchable list (the current one is marked `✓`; **Custom model id…** takes any `provider/model`). Click an effort or press `e` to pick from a single row of levels: only the levels that row's model supports, as its provider's catalog declares them (every level when the row inherits its model or the model is not in the catalog). Pi lands an unsupported level on the nearest supported one at launch, and the table says where: `max → high`. Click `Model ▾` or `Effort ▾`, or move the cursor to that header, to change every agent at once; the orchestrator is never part of that.
 - **Three buttons decide where it applies.** **Use in this session** (`u`) binds what you see to this Pi session only and switches its orchestrator; nothing shared is written. **Make default** (`d`) makes it the default for new sessions through the guarded global apply (diff confirmation, pin honesty, rollback). **Save** (`s` or `ctrl+s`) writes what you see into the profile. Use and Make default save pending edits first and say so.
 - **The profile menu**, `▾` on the active tab (`m`), holds **Rename**, **Duplicate**, **Use in this repo** (the clone pin; it reads **Stop using in this repo** when it already applies), and **Delete**. **+ New** (`n`) starts a profile as a copy of the current one, from what is running now, or empty.
@@ -1061,7 +1062,7 @@ Global routing is owned by profiles: edit a profile's routing on the models scre
 
 Startup and reload materialize saved non-empty routing, but never treat a saved empty agent entry (`{}`) as permission to delete an existing `subagents.json` model profile or agent frontmatter. This also preserves previously materialized routes and routes whose agent definition is missing. To clear routing, make a profile whose entries are inherit the default (or confirm a profile replacement) on the models screen. Activation needs no ownership sidecar or lock.
 
-`/gentle:models export` writes the saved routing to `~/.pi/gentle-ai/models.export.json`, and `/gentle:models restore` restores from that file after confirmation. Export uses a versioned envelope and restore writes the normal `models.json` shape before applying routing to agents.
+`/gentle:profiles export-routing` writes the saved routing to `~/.pi/gentle-ai/models.export.json`, and `/gentle:profiles restore-routing` restores from that file after confirmation. They carry `-routing` because they move the global `models.json` routing, not a profile: `/gentle:profiles export <name>` and `import` move one profile through `profiles.export.json`. Export uses a versioned envelope and restore writes the normal `models.json` shape before applying routing to agents.
 
 Config shape (per agent):
 
@@ -1167,7 +1168,7 @@ omitted if no valid profile remains.
 
 For a given working directory the winner is the local pin, then the repository declaration, then the globally active profile. A session resolves these layers once, when it starts, and keeps the result. Both are toggles: using one on the profile that already holds that layer removes it (the menu then reads **Stop using in this repo**), and either one outside a Git worktree writes nothing and says so.
 
-In a pinned repository the pinned profile governs subagent launches: the agents it names take its model and effort, and the agents it omits return to inherit (their own definition, then the default model). The default profile does not reach those launches, which `/gentle:models` reports when it runs inside a pinned repository. **Make default** follows the same boundary: when a valid pin wins it re-pins this clone (the clone-local pin) instead of writing the global routing; a malformed pin or one naming a missing profile is ignored, and Make default applies globally as it would outside a pinned repository, so it can never move another repository's routing. A committed repository declaration is never rewritten; when one still names another profile, the clone-local pin takes precedence and the screen says so. **Use in this session** writes no pin or shared routing (only pending table edits, saved to the profile first): it binds the profile to the current session, which outranks the pin for this session's launches. The tab of the pinned profile carries `⌂`.
+In a pinned repository the pinned profile governs subagent launches: the agents it names take its model and effort, and the agents it omits return to inherit (their own definition, then the default model). The default profile does not reach those launches, which `/gentle:profiles` reports when it runs inside a pinned repository. **Make default** follows the same boundary: when a valid pin wins it re-pins this clone (the clone-local pin) instead of writing the global routing; a malformed pin or one naming a missing profile is ignored, and Make default applies globally as it would outside a pinned repository, so it can never move another repository's routing. A committed repository declaration is never rewritten; when one still names another profile, the clone-local pin takes precedence and the screen says so. **Use in this session** writes no pin or shared routing (only pending table edits, saved to the profile first): it binds the profile to the current session, which outranks the pin for this session's launches. The tab of the pinned profile carries `⌂`.
 
 To share a pin, commit the repository declaration. When `.pi/` is ignored, Git cannot re-include a nested file until its parent directories are visible. The panel therefore prints these ordered root `.gitignore` rules, which keep unrelated `.pi` content ignored while making only the declaration committable:
 
@@ -1223,8 +1224,7 @@ The notice appears once per distinct change: further launches stay quiet until t
 | -------------------------------- | ------------------------------------------------------------------- |
 | `/gentle:status`              | Shows package assets and global model config status. |
 | `/gentle:doctor`              | Runs read-only diagnostics for assets, model/persona config, memory tools, safety guards, and (inside Herdr) the task-summary sidebar setup. |
-| `/gentle:models`                 | Opens the models screen on this repository's profile. `export` and `restore` move the saved routing through `models.export.json`. |
-| `/gentle:profiles`               | Opens the same screen. `export <name>`, `import`, and `publish <name>` handle profile files and the repository declaration. |
+| `/gentle:profiles`               | Opens the models screen on this repository's profile. `export <name>`, `import`, and `publish <name>` handle profile files and the repository declaration; `export-routing` and `restore-routing` move the saved global routing through `models.export.json`. |
 | `/gentle:commands`               | Opens the command palette (default `alt+k`): a curated, grouped menu (Configuration, Session, Diagnostics, Skills) of registered Gentle commands; search and run by label. |
 | `/gentle:persona`                | Switches global persona mode, with project override support.        |
 | `/gentle:background-subagents`   | Shows or sets the managed background-subagents policy (`status\|enable\|disable`), naming the source that decided it. |
@@ -1347,7 +1347,7 @@ The frame labels INSERT, NORMAL, VISUAL (characterwise), or VISUAL LINE (linewis
 
 **Deliberate `/` divergence from Claude Code:** NORMAL `/` hands off to **Pi's native slash commands and skills**, enters INSERT, and inserts `/` at the existing cursor. Pi offers slash completion only at the start of the first line; elsewhere it inserts a literal slash without moving or replacing the draft. There is **no reverse prompt-history search**. Pi's explicit history shortcuts still work, transferring to INSERT first. Unknown NORMAL printable input, encoded text and bracketed paste do not silently insert; application shortcuts can transfer to INSERT before acting.
 
-This is a bounded command subset, not full Claude Code/Vim parity. The private editor adapter supports only the audited Pi coding-agent/TUI `0.99.1`, `0.99.2`, `1.0.0`, `1.1.0`, and `1.2.0` package pairs. The two 0.99 releases have byte-identical editor and undo-stack sources. Pi 1.0.0, 1.1.0 and 1.2.0 are separately audited against the touched state, paste/history, cursor/layout, autocomplete and undo-snapshot contracts. Pi 1.2.0's paired APC fake-cursor markers remain intact so the host can suppress software cursors when hardware cursors are visible; selection inversion and empty-prompt hints support both these markers and legacy SGR cursors. Current bundled and unbundled 1.2.0 tests prove identity, edit/undo, paste, selection, wrapping/scroll and autocomplete behavior, not old/new byte identity. Fabricated metadata tests preserve exact-version admission coverage for the older audited releases. Version metadata must come from a canonical candidate host package root whose actual `CustomEditor` and `Editor` classes match the loaded classes, never from the extension's local metadata or CLI path alone. Unknown versions, mismatched prototypes, or invalid layouts fail closed: a single compatibility warning is shown and the prompt continues with ordinary editing instead of silently entering inert NORMAL mode. Operations that would cross a registered collapsed paste marker, or encounter duplicate occurrences of a registered marker ID, are rejected without editing it. Visual highlighting relies on Pi's render layout and may be omitted if its geometry cannot be validated. No live-terminal proof of every layout or complete parity is claimed.
+This is a bounded command subset, not full Claude Code/Vim parity. The private editor adapter supports only the audited Pi coding-agent/TUI `0.99.1`, `0.99.2`, `1.0.0`, `1.1.0`, `1.2.0`, `1.3.0`, and `1.4.0` package pairs. The two 0.99 releases have byte-identical editor and undo-stack sources. Pi 1.0.0, 1.1.0 and 1.2.0 are separately audited against the touched state, paste/history, cursor/layout, autocomplete and undo-snapshot contracts. Pi 1.2.0's paired APC fake-cursor markers remain intact so the host can suppress software cursors when hardware cursors are visible; selection inversion and empty-prompt hints support both these markers and legacy SGR cursors. Current bundled and unbundled 1.2.0 tests prove identity, edit/undo, paste, selection, wrapping/scroll and autocomplete behavior, not old/new byte identity. Fabricated metadata tests preserve exact-version admission coverage for the older audited releases. Version metadata must come from a canonical candidate host package root whose actual `CustomEditor` and `Editor` classes match the loaded classes, never from the extension's local metadata or CLI path alone. Unknown versions, mismatched prototypes, or invalid layouts fail closed: a single compatibility warning is shown and the prompt continues with ordinary editing instead of silently entering inert NORMAL mode. Operations that would cross a registered collapsed paste marker, or encounter duplicate occurrences of a registered marker ID, are rejected without editing it. Visual highlighting relies on Pi's render layout and may be omitted if its geometry cannot be validated. No live-terminal proof of every layout or complete parity is claimed.
 
 Startup banner settings remain global in `banner.json` under `GENTLE_PI_CONFIG_HOME` (default `~/.pi/gentle-ai`). Existing `showRose` and `showTextLogo` opt-outs independently control the main startup artwork; both default to enabled. Changes apply on the next session or `/reload`. Color presets are `pink` (default), `cyan`, `yellow`, and `green`. The static sidebar heading is independent of these preferences and follows the active theme.
 
