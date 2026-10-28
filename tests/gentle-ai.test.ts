@@ -1539,10 +1539,10 @@ test("models screen offers only the effort levels each model supports and shows 
 test("models screen lists configuration problems under the profile name without cutting them", () => {
 	const notices = [
 		"The local pin file /home/user/project/.git/gentle-ai/profile-pin.json is not a valid pin and is ignored. Fix or remove it.",
-		'No agent matches "sdd-design" in this profile, so it is ignored at launch.',
+		'Profile key "sdd-design" matches no agent configured in gentle-shell, so it is ignored at launch.',
 	];
 	const plain = renderScreen([], [], [], { width: 80, notices }).map(stripAnsi);
-	assert.ok(plain.some((line) => line.includes('⚠ No agent matches "sdd-design"')));
+	assert.ok(plain.some((line) => line.includes('⚠ Profile key "sdd-design"')));
 	assert.ok(!plain.some((line) => line.includes("…")));
 });
 
@@ -3531,7 +3531,7 @@ test("the models screen flags profile keys no agent matches and never flags prov
 	await fixture.run("gentle:profiles");
 	const flat = (rendered: string) => rendered.replace(/\s*│\s*/g, " ").replace(/\s+/g, " ");
 	assert.equal(rendered.split("\n").length, 24, "the frame spans the terminal height");
-	assert.match(flat(rendered), /⚠ No agent matches "sdd-design" in this profile, so it is ignored at launch\./);
+	assert.match(flat(rendered), /⚠ Profile key "sdd-design" matches no agent configured in gentle-shell, so it is ignored at launch\./);
 	assert.doesNotMatch(flat(rendered), /review-refuter"/, "provider review roles are never flagged");
 	assert.match(rendered, /Orchestrator\s+nan\/glm5\.3\s+high/);
 	assert.match(rendered, /worker\s+openai\/alpha\s+high/);
@@ -3555,7 +3555,7 @@ test("at 60 columns the unmatched-key notice wraps instead of being cut", async 
 	assert.ok(panel);
 	const narrow = stripAnsi(panel.render(60).join("\n"));
 	const flat = (rendered: string) => rendered.replace(/\s*│\s*/g, " ").replace(/\s+/g, " ");
-	assert.match(flat(narrow), /⚠ No agent matches "sdd-design" in this profile, so it is ignored at launch\./);
+	assert.match(flat(narrow), /⚠ Profile key "sdd-design" matches no agent configured in gentle-shell, so it is ignored at launch\./);
 	assert.ok(!narrow.split("\n").some((line) => line.includes("…")), "nothing is cut");
 });
 

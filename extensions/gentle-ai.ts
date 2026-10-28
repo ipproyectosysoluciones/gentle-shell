@@ -4519,10 +4519,12 @@ function routingScreenNotices(
 	const unmatched = unmatchedProfileKeys(Object.fromEntries(profileKeys.map((key) => [key, { model: undefined, thinking: undefined }])), known);
 	const ignored = unmatched.filter((entry) => entry.suggestion === undefined).map((entry) => entry.key);
 	if (ignored.length > 0) {
-		notices.push(`No agent matches ${ignored.map((key) => `"${key}"`).join(", ")} in this profile, so ${ignored.length === 1 ? "it is" : "they are"} ignored at launch.`);
+		notices.push(
+			`Profile key${ignored.length === 1 ? "" : "s"} ${ignored.map((key) => `"${key}"`).join(", ")} match${ignored.length === 1 ? "es" : ""} no agent configured in gentle-shell, so ${ignored.length === 1 ? "it is" : "they are"} ignored at launch.`,
+		);
 	}
 	for (const entry of unmatched) {
-		if (entry.suggestion !== undefined) notices.push(`No agent is named "${entry.key}" in this profile; did you mean ${entry.suggestion}?`);
+		if (entry.suggestion !== undefined) notices.push(`Profile key "${entry.key}" matches no agent configured in gentle-shell; did you mean ${entry.suggestion}?`);
 	}
 	// Issue #2400: model_profiles keys in subagents.json that match nothing and
 	// suggest nothing. A session binding or a winning pin replaces those launches'
