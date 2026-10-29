@@ -108,7 +108,9 @@ function hookedExtension(processEnv: NodeJS.ProcessEnv = {}) {
 			type: "agent_before_settle", entries, continue: false, outcome: "completed",
 			context: { contextEntries: [], contextMessages: [user("Do it."), assistant(finalText)], llmMessages: [], pendingMessages: [], canContinue: false },
 		})) as SettleResult | undefined,
+		agentStart: (event: Record<string, unknown> = {}) => emit("before_agent_start", { type: "before_agent_start", prompt: "Do it.", systemPrompt: "", ...event }),
 		agentEnd: () => emit("agent_end", { type: "agent_end", messages: [] }),
+		settled: () => emit("agent_settled", { type: "agent_settled" }),
 		sent,
 	};
 }
@@ -231,4 +233,49 @@ test("a real Pi session appends one settle reminder and continues once after a d
 		for (const [key, value] of Object.entries(previous)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
 		rmSync(root, { recursive: true, force: true });
 	}
+});
+
+// #2653 follow-up: an in-process named-agent run never records verifier attempts (its tool calls are not primary), so its
+// settle must never remind, whatever its final text declares. The next primary run still is reminded.
+test("S1: a named-agent run is never reminded at settle, and the next primary run still is", async () => {
+	const session = hookedExtension();
+	await session.input();
+	await session.agentStart({ agentName: "gentle-ai-worker" });
+	await session.agentEnd();
+	assert.equal(await session.settle("Worker done.\nRisk: item 3 (shared parser)"), undefined);
+	await session.settled();
+	await session.agentStart();
+	const result = await session.settle("Implemented.\nRisk: item 3 (shared parser)");
+	assert.equal(result?.continue, true);
+	assert.equal(result?.entries?.[0]?.content, verifierSettleReminderText(3));
+});
+
+// A named agent nested inside a primary run settles before it. Its settle is paired off without touching the primary
+// run's classification, and without relying on `agent_end` (which, without native review, never pairs the depth off).
+test("S1: a named-agent run nested in a primary run does not suppress the primary run's reminder", async () => {
+	const session = hookedExtension();
+	await session.input();
+	await session.agentStart();
+	await session.agentStart({ agentName: "review-readability" });
+	await session.agentEnd();
+	assert.equal(await session.settle("Review done.\nRisk: item 2 (auth)"), undefined, "the nested named run is not reminded");
+	await session.settled();
+	await session.agentEnd();
+	const result = await session.settle("Implemented.\nRisk: item 3 (shared parser)");
+	assert.equal(result?.continue, true, "the primary run is still reminded");
+	assert.equal(result?.entries?.[0]?.content, verifierSettleReminderText(3));
+});
+
+// Pi can check settlement again after a continuation without a new `before_agent_start`, so a named run stays named until
+// `agent_settled`, and only then does the next settle count as the primary run's.
+test("S1: a named-agent run stays unreminded across continuation settles until it has settled", async () => {
+	const session = hookedExtension();
+	await session.input();
+	await session.agentStart();
+	await session.agentStart({ agentName: "review-readability" });
+	assert.equal(await session.settle("Review done.\nRisk: item 2 (auth)"), undefined);
+	assert.equal(await session.settle("Review still done.\nRisk: item 2 (auth)"), undefined, "a continuation settle of the named run is not reminded");
+	await session.settled();
+	const result = await session.settle("Implemented.\nRisk: item 3 (shared parser)");
+	assert.equal(result?.continue, true, "the primary run is reminded once the named run settled");
 });
