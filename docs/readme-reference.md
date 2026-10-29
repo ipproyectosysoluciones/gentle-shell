@@ -659,7 +659,7 @@ Synthetic tests prove the observer's behavior, not the cause of issue #213. A ne
 ```text
 /gentle:status          Check package assets and global model config.
 /gentle:doctor          Run read-only diagnostics for assets, config, tools, guards, and Herdr setup.
-/gentle:profiles           Open the models screen on this repository's profile. Subcommands: export <name>, import, publish <name>, export-routing, restore-routing.
+/gentle:profiles           Open the models screen on this repository's profile. Subcommands: export <name>, import, publish <name>, export-routing, restore-routing, clear.
 /gentle:persona            Switch between gentleman and neutral persona modes.
 /gentle:background-subagents  Show or set the managed background-subagents policy, with its deciding source.
 /gentle:review-mode          Show or set the receipt-driven development mode (status|enable|disable).
@@ -1106,6 +1106,8 @@ The binding made by **Use in this session** writes no shared routing: not `model
 | Not yet persisted | Use in this session explicitly reports a preflush selection. It is usable now, but detach/reload does not restore it without later disk corroboration. |
 | Append failure | No success or live-model effect. Keep only returned disk-corroborated state; otherwise block affected launches. |
 | Invalid, future or unavailable authority | Do not fall through to shared routing; affected subagent launches are blocked. An explicit successful selection or fresh corroboration can restore availability. |
+
+`/gentle:profiles clear` removes this session's selection: it appends an explicit clear record, so new launches use the routing without a session profile (pins, repository declaration, global) and resume/reload keep it cleared. The live orchestrator, `profiles.json`, `models.json`, pins and Pi settings are untouched. A session that never selected a profile, or is already cleared, writes nothing and says so. Clear is also the recovery path for an invalid or newer-version record: on start, resume, reload and tree navigation such a record raises a warning with the session file and entry index, and affected launches stay blocked until Use in this session or clear replaces it.
 
 Start, resume, reload, fork and tree navigation restore only the current corroborated branch state. Restoration never applies the profile's orchestrator. Fork capture is read-only until a confirmed transition; cancellation/rejection preserves current authority. Pending Use in this session live operations settle before fork-copy, tree movement or detach.
 

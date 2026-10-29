@@ -118,6 +118,7 @@ import {
 import { clearSessionProfileBinding, readSessionProfileBinding } from "../lib/session-profile-binding.ts";
 import { createSessionProfileIntegration, hasPendingSessionProfileSelection, readCurrentSessionProfileOutcome, runCurrentSessionProfileSelection, waitCurrentSessionProfileSelection } from "../lib/session-profile-integration.ts";
 import { publishSessionProfileOutcome, readSessionProfileAuthority } from "../lib/session-profile-authority.ts";
+import { isSessionProfileFamilyEntry } from "../lib/session-profile-persistence.ts";
 import {
 	applyOrchestratorSettings,
 	readOrchestratorSettings,
@@ -5515,11 +5516,12 @@ async function runProfilesPanelAction(
 }
 
 /** `/gentle:profiles`: seed or open the store, then loop the panel over one action at a time until it closes. */
-const PROFILES_COMMAND_USAGE = "Usage: /gentle:profiles [export <name> | import | publish <name> | export-routing | restore-routing]";
+const PROFILES_COMMAND_USAGE = "Usage: /gentle:profiles [export <name> | import | publish <name> | export-routing | restore-routing | clear]";
 
 /**
  * `/gentle:profiles` opens the models screen. File operations live in
- * subcommands rather than on the screen: `export <name>` and `import` move a
+ * subcommands rather than on the screen: `clear` ends this session's profile
+ * selection, `export <name>` and `import` move a
  * profile through `profiles.export.json`, `publish <name>` toggles the
  * committed repository declaration, and `export-routing` / `restore-routing`
  * move the saved global routing (models.json, not a profile) through
@@ -5532,13 +5534,14 @@ async function handleProfilesCommand(ctx: ExtensionContext, live: LiveSession, a
 		await openModelsScreen(ctx, live);
 		return;
 	}
-	if (verb === "export-routing" || verb === "restore-routing") {
+	if (verb === "export-routing" || verb === "restore-routing" || verb === "clear") {
 		if (rest.length > 0) {
 			ctx.ui.notify(PROFILES_COMMAND_USAGE, "warning");
 			return;
 		}
 		if (verb === "export-routing") await exportRoutingCommand(ctx);
-		else await restoreModelExport(ctx);
+		else if (verb === "restore-routing") await restoreModelExport(ctx);
+		else await handleProfilesClear(ctx);
 		return;
 	}
 	const store = await loadProfilesStore(ctx);
@@ -5815,6 +5818,70 @@ async function openProfilesPanelLoop(
 			}
 		}
 	}
+}
+
+/**
+ * `/gentle:profiles clear`: append an explicit clear record for this session and
+ * publish only the returned state. Never-bound and already-cleared sessions write
+ * nothing; an unreadable record is the recovery case and is cleared. The live
+ * orchestrator and every shared default stay untouched.
+ */
+async function handleProfilesClear(ctx: ExtensionContext): Promise<void> {
+	const sessionId = ctx.sessionManager?.getSessionId?.();
+	if (typeof sessionId !== "string" || sessionId.length === 0) {
+		ctx.ui.notify("el Gentleman cannot clear the session profile: no parent session id is available here.", "warning");
+		return;
+	}
+	const selected = await runCurrentSessionProfileSelection(ctx.sessionManager, async (attachment, owned) => {
+		const prior = attachment.refresh().state;
+		// An unsaved or in-memory branch reads as indeterminate; without any profile
+		// record on the branch it was never selected, so nothing is written.
+		const selectedBefore = ctx.sessionManager.getBranch().some((entry) => isSessionProfileFamilyEntry(entry));
+		if (prior.status === "absent" || (prior.status === "indeterminate" && !selectedBefore)) {
+			ctx.ui.notify("el Gentleman: no session profile was ever selected in this session; nothing to clear.", "info");
+			return true;
+		}
+		if (prior.status === "cleared") {
+			ctx.ui.notify("el Gentleman: this session profile is already cleared; nothing to clear.", "info");
+			return true;
+		}
+		const outcome = attachment.clear();
+		if (!owned()) return false;
+		const authority = publishSessionProfileOutcome(ctx.sessionManager, outcome);
+		if ((outcome.status !== "persisted" && outcome.status !== "not-persisted") || outcome.state.status !== "cleared" || !authority.available) {
+			ctx.ui.notify(
+				`el Gentleman could not clear the session profile. ${authority.available ? "The last disk-corroborated state was preserved." : "Session profile authority is unavailable; affected launches are blocked."}`,
+				"warning",
+			);
+			return false;
+		}
+		const what = prior.status === "bound" ? `session profile "${prior.binding.name}"` : "the unreadable session profile record";
+		ctx.ui.notify(
+			`el Gentleman cleared ${what} — ${outcome.status === "persisted" ? "persisted in this session" : "not yet persisted; active only until detach or disk corroboration"}. New launches use the routing without a session profile (pins, repository declaration, global). The live orchestrator is unchanged.`,
+			"info",
+		);
+		return true;
+	});
+	// A selection skipped by a reload or session replacement leaves a stale ctx;
+	// only a still-active command reports the missing attachment.
+	if (selected === undefined && isCommandContextActive(ctx))
+		ctx.ui.notify("el Gentleman cannot clear the session profile: the current session attachment is unavailable. Nothing was changed.", "warning");
+}
+
+/**
+ * Warn when the current session profile record cannot be read: an invalid record
+ * or one from a newer version blocks affected launches instead of falling back.
+ */
+function notifySessionProfileProblem(ctx: ExtensionContext): void {
+	const state = readCurrentSessionProfileOutcome(ctx.sessionManager)?.state;
+	if (state?.status !== "invalid" && state?.status !== "unsupported") return;
+	const file = ctx.sessionManager.getSessionFile?.() ?? "this in-memory session";
+	const where = `${sanitizeTerminalText(file)} entry ${state.entryIndex ?? "?"}${state.lineNumber === undefined ? "" : ` (line ${state.lineNumber})`}`;
+	const kind = state.status === "invalid" ? "invalid" : "from a newer version";
+	ctx.ui.notify(
+		`el Gentleman: the session profile record at ${where} is ${kind}. Subagent launches are blocked until it is replaced. Select a profile with Enter or run /gentle:profiles clear.`,
+		"warning",
+	);
 }
 
 /** Pi's runner throws on any access to a ctx made stale by reload or session replacement. */
@@ -10257,6 +10324,7 @@ export const __testing = {
 	parseReviewCaptureGroupParameters,
 	runProfilesPanelAction,
 	openProfilesPanelLoop,
+	notifySessionProfileProblem,
 	resolveReviewModeGate,
 	readEffectiveModelConfig,
 	readReviewerModelConfig,
@@ -10434,6 +10502,7 @@ function createGentleAiExtensionForTesting(
 		reviewSidebar.reset(ctx);
 		statusTiming.reset(ctx);
 		readSessionProfileAuthority(ctx.sessionManager);
+		if (ctx.hasUI) notifySessionProfileProblem(ctx);
 	});
 	// Lean RDD-off review loadout (applyRddOffReviewPrompt): every
 	// before_agent_start sets it from the pinned line before Pi prepares that
@@ -10849,6 +10918,7 @@ function createGentleAiExtensionForTesting(
 		if (profileSessionId) clearSessionProfileBinding(profileSessionId);
 		sessionProfiles.start(ctx.sessionManager, (type, data) => pi.appendEntry(type, data), event);
 		readSessionProfileAuthority(ctx.sessionManager);
+		if (ctx.hasUI) notifySessionProfileProblem(ctx);
 		auto.reset();
 		yolo.reset(ctx);
 		// Package-owned children reset local state but never initialize primary defaults.
@@ -11217,7 +11287,7 @@ function createGentleAiExtensionForTesting(
 	}
 
 	pi.registerCommand("gentle:profiles", {
-		description: "Open the models screen (profiles as tabs). Subcommands: export <name>, import, publish <name>, export-routing, restore-routing.",
+		description: "Open the models screen (profiles as tabs). Subcommands: export <name>, import, publish <name>, export-routing, restore-routing, clear.",
 		handler: async (args, ctx) => {
 			await handleProfilesCommand(ctx, pi, typeof args === "string" ? args : "");
 		},
