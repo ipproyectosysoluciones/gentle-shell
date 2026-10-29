@@ -1,4 +1,5 @@
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
+import { isDeepStrictEqual } from "node:util";
 import { appendSystemPromptOnce } from "../lib/append-system-prompt.ts";
 import { dataArgumentRanges, recognizeDestructiveCommands } from "../lib/destructive-command-guard.ts";
 import { defaultTempScratchFs, isTempScratchRemoval, type TempScratchFs } from "../lib/yolo-temp-scratch.ts";
@@ -4970,7 +4971,7 @@ async function runProfilesPanelAction(
 				const current = () => {
 					if (!owned()) return false;
 					const state = readCurrentSessionProfileOutcome(ctx.sessionManager)?.state;
-					return state?.status === "bound" && JSON.stringify(state.binding) === JSON.stringify(snapshot);
+					return state?.status === "bound" && isDeepStrictEqual(state.binding, snapshot);
 				};
 				const orchestrator = readProfileOrchestrator(snapshot.modelProfiles);
 				const liveNote = orchestrator === undefined ? "" : await switchLiveOrchestrator(ctx, {
