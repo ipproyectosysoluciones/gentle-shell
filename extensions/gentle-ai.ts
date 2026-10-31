@@ -7,6 +7,7 @@ import { SHELL_COMMAND_TOOLS } from "../lib/background-jobs.ts";
 import { evaluateDeliveredTestTool } from "../lib/delivered-test-lint.ts";
 import { commitSliceToolResult } from "../lib/commit-slice-signal.ts";
 import { appendContextBackstopNotice, createContextBackstopSignal, createThrottledContextMeasure } from "../lib/context-backstop.ts";
+import { createExplorationBudget } from "../lib/exploration-budget.ts";
 import { blockChildDestructiveCommand } from "./child-safety.ts";
 import { allowedEditSurfaces as hasTaskScopedAllowedEditSurfaces, bindSessionRepositoryPreparation, captureBoundSessionRepositoryAuthority, isHomeOrBroadUserDirectory, prepareBoundSessionRepository, rejectUndocumentedWriterLaunch, rejectUnscopedBoundedWriterDispatch, safeBootstrapDirectory, sourcePathWithinProject } from "../lib/bounded-writer-admission.ts";
 import { rejectUnriskedVerifierLaunch } from "../lib/verifier-admission.ts";
@@ -10731,6 +10732,7 @@ function createGentleAiExtensionForTesting(
 	}, { configHome: gentlePiConfigHome(permissionEnvironment) });
 	const auto = autoPermissions;
 	const verifierSettleReminders = createVerifierSettleReminders<PendingReviewConsentSessionKey>();
+	const explorationBudget = createExplorationBudget();
 	// Named-agent or child runs started and not yet settled, per session. Such a run never records verifier attempts (its
 	// tool calls are not primary), so its settle checks must not remind. Each one pairs off at its own `agent_settled`,
 	// nested runs included: Pi may check settlement again after a continuation without a new `before_agent_start`, and
@@ -11321,6 +11323,7 @@ function createGentleAiExtensionForTesting(
 		const isChildSession = permissionEnvironment.GENTLE_PI_AGENTS_CHILD === "1";
 		const isPrimarySession = !isNamedAgent && !isChildSession;
 		const subagentDepthKey = pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey);
+		if (isPrimarySession && !ctx.signal?.aborted) explorationBudget.start(subagentDepthKey);
 		if (isNamedAgent || isChildSession) {
 			processAgentEndSubagentDepth.set(subagentDepthKey, (processAgentEndSubagentDepth.get(subagentDepthKey) ?? 0) + 1);
 		} else {
@@ -11476,6 +11479,7 @@ function createGentleAiExtensionForTesting(
 		const sessionKey = pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey);
 		const namedRuns = verifierSettleNamedRuns.get(sessionKey) ?? 0;
 		if (namedRuns > 0) verifierSettleNamedRuns.set(sessionKey, namedRuns - 1);
+		else explorationBudget.settle(sessionKey);
 	});
 
 	const recordWriteResult = async (event: ToolResultEvent, ctx: ExtensionContext): Promise<void> => {
@@ -11507,6 +11511,12 @@ function createGentleAiExtensionForTesting(
 		// so a crossing is announced on the next sampled result — never later than one window past it.
 		const sessionKey = pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey);
 		const primary = permissionEnvironment.GENTLE_PI_AGENTS_CHILD !== "1" && (processAgentEndSubagentDepth.get(sessionKey) ?? 0) === 0;
+		const explorationNotice = explorationBudget.result(sessionKey, event, primary, ctx.signal?.aborted === true);
+		// Keep discovery payloads intact. Steer only an already-active run so the
+		// next model step sees the notice without starting a new run while idle.
+		if (explorationNotice && typeof ctx.isIdle === "function" && !ctx.isIdle()) {
+			try { pi.sendMessage({ customType: "gentle-pi.exploration-budget", content: explorationNotice, details: explorationBudget.facts(sessionKey), display: true }, { deliverAs: "steer", triggerTurn: true }); } catch { /* Advisory only. */ }
+		}
 		let notice: string | undefined;
 		try { notice = primary ? contextBackstopSignal(sessionKey, contextBackstopMeasure(sessionKey, () => ctx.getContextUsage?.())) : undefined; } catch { notice = undefined; }
 		const withNotice = (patch: ToolResultEventResult | undefined) => notice ? appendContextBackstopNotice(event, patch, notice) : patch;
@@ -11527,6 +11537,7 @@ function createGentleAiExtensionForTesting(
 			return { block: true, reason: `${event.toolName} runs only as a direct tool call: call it directly, never from codemode or another tool.` };
 		}
 		const primaryToolCall = permissionEnvironment.GENTLE_PI_AGENTS_CHILD !== "1" && (processAgentEndSubagentDepth.get(pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey)) ?? 0) === 0;
+		if (primaryToolCall && !ctx.signal?.aborted) explorationBudget.call(pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey), event.toolCallId, event.toolName, event.parentToolCallId);
 		// #2652: count a verifier launch attempt before any admission check can reject it.
 		if (primaryToolCall) verifierSettleReminders.toolCall(pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey), event.toolName, event.input);
 		// One early mode read settles the session binding (and its one-time epoch
