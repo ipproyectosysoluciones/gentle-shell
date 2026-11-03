@@ -3,6 +3,7 @@ import { sharedCooldown } from "../lib/model-fallback-policy.ts";
 import { createOrchestratorFallback } from "../lib/orchestrator-fallback.ts";
 import type { ThinkingLevel } from "../lib/model-routing-authority.ts";
 import { agentsViewKey, agentsCollapseKey, agentsStopKey } from "../lib/agents-keys.ts";
+import { CHILD_TIER_ENV } from "../lib/openai-fast-tier.ts";
 import { spawn } from "node:child_process";
 import { Type } from "typebox";
 import { recordReviewMutation } from "../lib/review-reminder-receipt.ts";
@@ -105,6 +106,8 @@ const CLOCK_TICK_MS = 1000;
 const TOOL_PREFIX = "subagent_";
 // Wakes an idle parent after child content was stored as a custom message.
 // It names itself as automated so the model never attributes it to the human.
+// Persisted Bridge identities embed this exact text, so changing it would
+// unhide the wakes of existing sessions.
 const PARENT_WAKE_TEXT = "[System-generated Gentle Agents notification, not written by the user] Subagent output was delivered to this session above. Review it and continue.";
 const PARENT_WAKE_TYPE = "gentle-agents.wake";
 const BRIDGE_WAKE_IDENTITY_TYPE = "gentle-agents.wake-identity";
@@ -114,7 +117,10 @@ interface BridgeWakeIdentity {
 	text: string;
 }
 const bridgeWakeText = (nonce: string): string => `${PARENT_WAKE_TEXT} [gentle-agents wake: ${nonce}]`;
-const NATIVE_PARENT_WAKE_TEXT = "Review the delivered subagent output and continue.";
+// Pi gives the hidden native wake to the model with the user role, so an
+// unlabeled English wake read as an English human turn and switched the reply
+// language. It disowns authorship and pins the human's language.
+const NATIVE_PARENT_WAKE_TEXT = `${PARENT_WAKE_TEXT} Reply in the language of the human's own last message, not the language of this notification or of the subagent output.`;
 // How long a dispatched wake may take to start a parent run before a later
 // delivery may send another one.
 export const PARENT_WAKE_GRACE_MS = 30_000;
@@ -2137,7 +2143,17 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const parentWorktreeRoot = ctx.sessionManager.getCwd();
 		const parentRepositoryIdentity = resolveCanonicalGitRepositoryIdentitySync(parentWorktreeRoot);
 		const childEnv = { ...deps.env };
+		delete childEnv[CHILD_TIER_ENV];
+		const childModel = profile.model ?? ctx.model;
+		if (profile.tier && childModel?.provider && childModel.id) {
+			childEnv[CHILD_TIER_ENV] = JSON.stringify({ tier: profile.tier, model: `${childModel.provider}/${childModel.id}` });
+		}
 		if (foreign) for (const key of inheritedUnsafeGitEnvironmentKeys(childEnv)) delete childEnv[key];
+		const extensions = childExtensionRequest(deps.env, deps.childExtensionPaths);
+		if (profile.tier && !parseChildPackageInjection(deps.env)) {
+			const fastPath = fileURLToPath(new URL("./gentle-fast.ts", import.meta.url));
+			if (existsSync(fastPath)) extensions.extensionPaths = [...new Set([...(extensions.extensionPaths ?? []), fastPath])];
+		}
 		const request: TaskRequest = {
 			agent,
 			prompt,
@@ -2169,7 +2185,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			})(),
 			sessionDir,
 			resumeSessionPath: resume,
-			...childExtensionRequest(deps.env, deps.childExtensionPaths),
+			...extensions,
 			// A writer claims its surfaces in its canonical worktree root for its queued
 			// and running lifetime; a continuation is a new task and claims them again.
 			...(isBoundedWriter(agent.name) && surfaces ? { writerSurfaces: surfaces, writerRoot: canonicalWriterRoot(target ?? parentWorktreeRoot, foreign ? resolveSessionWorktree : deps.resolveWorktree) } : {}),
