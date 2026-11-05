@@ -17,9 +17,36 @@ rule exists because of real incidents.
 
 ## Verification commands
 
-- Full suite: `pnpm test`
+- Full suite: `node scripts/run-test-suite.mjs` (see the pnpm rule below)
+- Full suite via pnpm: `pnpm test` — only after the pnpm rule below is satisfied
 - Single file: `node --test tests/<file>.test.ts`
 - Runtime modules: `pnpm check:runtime-modules`
+
+### pnpm: `verify-deps-before-run` hangs the suite
+
+pnpm 11 runs a dependency check before **every** script, and with the default
+setting it performs a real `pnpm install` first. In this repository that
+install can stall indefinitely with no output, no network sockets and no store
+writes — it looks exactly like a slow test suite, so it wastes the whole run.
+
+Observed on Linux, pnpm 11.1.1: `pnpm test` sat for **36 minutes** having used
+only 25 s of CPU, with 0 open sockets and 0 files written to the pnpm store in
+the last 5 minutes (the process was parked in `ep_poll`). Running the suite
+script directly finished the same work in under two minutes.
+
+Rules:
+
+- Run the suite with `node scripts/run-test-suite.mjs` so no dependency check
+  can trigger an install.
+- If you deliberately want pnpm, disable the pre-check explicitly:
+  `pnpm --config.verify-deps-before-run=false test`.
+- Never report a long run as "still running" without proving progress. Check
+  CPU time, open sockets and recent store writes before waiting on it:
+  `ps -o time= -p <pid>`, `ls -l /proc/<pid>/fd | grep -c socket`, and
+  `find <store> -newermt "-5 minutes" -type f | wc -l`. A process with no CPU,
+  no sockets and no store writes is hung, not busy.
+- If a run is hung, stop it and relaunch. Do not add a timeout and then report
+  the timeout as a test failure — the suite never ran.
 
 Some tests are environment-dependent (Windows/WSL paths, network reachability,
 npm-driven installs). A failure that reproduces on a clean checkout of
