@@ -38,6 +38,11 @@ Rules:
 
 - Run the suite with `node scripts/run-test-suite.mjs` so no dependency check
   can trigger an install.
+- The suite spawns `pnpm run <stage>` for its own stages, so one clean direct
+  invocation is not enough. Export the setting for the whole run, or the stages
+  hit the same pre-script install (and from a worktree whose `node_modules` is a
+  symlink, pnpm stops to ask whether to purge it):
+  `CI=true npm_config_verify_deps_before_run=false node scripts/run-test-suite.mjs`.
 - If you deliberately want pnpm, disable the pre-check explicitly:
   `pnpm --config.verify-deps-before-run=false test`.
 - Never report a long run as "still running" without proving progress. Check
