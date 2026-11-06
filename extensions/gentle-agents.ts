@@ -48,7 +48,7 @@ import { ActiveSessionClient, ActiveSessionListener, SessionPresenceError, Sessi
 import { WindowsActiveSessionClient, WindowsActiveSessionListener, WindowsSessionPresenceRegistry, WindowsSessionRegistryPhaseSequence, type WindowsSessionRegistryPhaseObserver } from "../lib/windows-session-transport.ts";
 import { hasReviewSessionPermission, resolveCanonicalGitRepositoryIdentitySync, type ReviewSessionManager } from "../lib/review-session-standing-permission.ts";
 import { inheritedUnsafeGitEnvironmentKeys } from "../lib/review-repository.ts";
-import { historyDir, loadHistory, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
+import { historyDir, loadHistory, loadStoredTask, pruneHistory, saveTask, type StoredTask } from "../lib/agents-history.ts";
 import { sessionToMarkdown } from "../lib/agents-transcript.ts";
 import { AgentsView } from "../lib/agents-view.ts";
 import { withOverlayRepaint } from "../lib/overlay-repaint.ts";
@@ -709,6 +709,8 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const stopStatusNotifications = publishTaskStatusChanges(store, pi.events, () => performance.now());
 	pi.on("session_shutdown", () => { stopStatusNotifications(); });
 	const restoredTaskIds = new Set<string>();
+	// The latest resumed-session history restoration; list_tasks waits for it.
+	let sessionRestoration: Promise<void> = Promise.resolve();
 	const tasksDir = historyDir(deps.home, agentHome);
 	let ui: ExtensionContext["ui"] | undefined;
 	// The session that owns the Agents widget, so a click on an agent row opens its /gentle:agents view.
@@ -990,7 +992,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				listener = sessionTransport.createListener(registry, sessionId, async (notification) => {
 					const active = activeSessionTransport;
 					if (!active || active.generation !== generation || active.sessionManager !== sessionManager || active.sessionId !== sessionId || sessions !== sessionManager || activeSessionId() !== sessionId) throw new Error("stale session transport");
-					pi.sendMessage({ customType: AGENTS_ORCHESTRATOR_MESSAGE_TYPE, content: `Session message from ${notification.senderSessionId} (correlation ${notification.id}): ${notification.message}`, display: true, details: { gentleAgents: { senderSessionId: notification.senderSessionId, recipientSessionId: sessionId, correlationId: notification.id, direction: "incoming", message: notification.message, senderLabel: messagePeerLabel(agentHome, notification.senderSessionId), recipientLabel: sanitizeDisplayLabel(sessionManager.getSessionName?.() ?? "") } } }, { deliverAs: "followUp", triggerTurn: true });
+					deliverOrchestratorMessage({ customType: AGENTS_ORCHESTRATOR_MESSAGE_TYPE, content: `Session message from ${notification.senderSessionId} (correlation ${notification.id}): ${notification.message}`, display: true, details: { gentleAgents: { senderSessionId: notification.senderSessionId, recipientSessionId: sessionId, correlationId: notification.id, direction: "incoming", message: notification.message, senderLabel: messagePeerLabel(agentHome, notification.senderSessionId), recipientLabel: sanitizeDisplayLabel(sessionManager.getSessionName?.() ?? "") } } }, sessionId);
 				});
 				client = sessionTransport.createClient(registry, sessionId);
 				if (sessions !== sessionManager || generation !== transportGeneration || activeSessionId() !== sessionId) {
@@ -1084,6 +1086,17 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		void saveTask(tasksDir, task, store.thread(task.id))
 			.then(() => pruneHistory(tasksDir, loadAgentsConfig({ cwd: task.cwd, home: deps.home, agentHome }).historyMaxTasks))
 			.catch(() => {});
+	};
+
+	// A launched task is written to disk immediately so abrupt parent process
+	// termination (SIGKILL, host reboot, crash) leaves a durable record (#1741).
+	// Pruning is deferred until final persistence in onFinish. saveTask keeps
+	// one task's writes in call order, and a task that is already terminal is
+	// skipped here so its onFinish record is the last one on disk.
+	const persistLaunch = (id: string) => {
+		const task = store.get(id);
+		if (!task || isFinished(task.status)) return;
+		void saveTask(tasksDir, task, store.thread(id)).catch(() => {});
 	};
 
 	// A background result used to be handed straight to the host as a followUp
@@ -1249,6 +1262,11 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	// A parent that is busy without a run (compaction, or a prompt's pre-run
 	// compaction) is not streaming, so steer + triggerTurn would also start a
 	// direct turn. Its content stays queued ("hold") until a later boundary.
+	//
+	// Three sources use this one router: child completions, child messages
+	// (queries and notifications), and incoming orchestrator session messages.
+	// The route decision is also the single point where a receiver-side
+	// admission policy for session messages (#1518) would plug in.
 	type ParentRoute = "idle" | "run" | "hold";
 	// Throws for a missing or stale parent context, so delivery fails closed.
 	const parentRoute = (): ParentRoute => {
@@ -1321,9 +1339,12 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		}
 	};
 
-	const sendToParent = (message: Parameters<ExtensionAPI["sendMessage"]>[0], route: Exclude<ParentRoute, "hold">) => {
+	// `runMode` is how a message joins a run in progress: child content steers
+	// (see the #867 rationale above); an orchestrator session message is a
+	// follow-up, so it never interrupts the turn the parent is working on.
+	const sendToParent = (message: Parameters<ExtensionAPI["sendMessage"]>[0], route: Exclude<ParentRoute, "hold">, runMode: "steer" | "followUp" = "steer") => {
 		if (route === "run") {
-			pi.sendMessage(message, { deliverAs: "steer", triggerTurn: true });
+			pi.sendMessage(message, { deliverAs: runMode, triggerTurn: true });
 			return;
 		}
 		pi.sendMessage(message, { triggerTurn: false });
@@ -1336,6 +1357,34 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		// onQuery: a completion owned by another session is dropped, not delivered.
 		if (activeSessionId() !== task.parentSessionId) return;
 		sendToParent({ customType: AGENTS_RESULT_TYPE, content: completionText(task), display: true, details: taskDetails(task) }, route);
+	};
+
+	// Incoming orchestrator session messages. The transport has already
+	// acknowledged the sender when the listener runs, so a message held for a
+	// busy parent that is then dropped by a session change is lost, exactly like
+	// pending child content. A stale or missing parent context throws instead,
+	// so the sender learns that delivery failed.
+	interface HeldOrchestratorMessage { message: Parameters<ExtensionAPI["sendMessage"]>[0]; recipientSessionId: string }
+	let heldOrchestratorMessages: HeldOrchestratorMessage[] = [];
+	const deliverOrchestratorMessage = (message: Parameters<ExtensionAPI["sendMessage"]>[0], recipientSessionId: string) => {
+		const route = parentRoute();
+		if (route === "hold") {
+			heldOrchestratorMessages.push({ message, recipientSessionId });
+			return;
+		}
+		sendToParent(message, route, "followUp");
+	};
+	const flushOrchestratorMessages = () => {
+		if (heldOrchestratorMessages.length === 0) return;
+		const route = deliveryRoute(false);
+		if (!route) return;
+		const held = heldOrchestratorMessages;
+		heldOrchestratorMessages = [];
+		for (const { message, recipientSessionId } of held) {
+			if (activeSessionId() !== recipientSessionId) continue;
+			try { sendToParent(message, route, "followUp"); }
+			catch { /* Best-effort delivery: at most once, even if forwarding fails. */ }
+		}
 	};
 
 	// A stale report must not re-enter the LLM conversation, but the parent is
@@ -1428,6 +1477,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	};
 
 	const flushAll = () => {
+		flushOrchestratorMessages();
 		flushMessages();
 		flushCompletions();
 		flushJobNotices();
@@ -1455,6 +1505,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		wakeVisibilityWarning = false;
 		parentRunActive = false;
 		wakeOwed = false;
+		heldOrchestratorMessages = [];
 		endPromptStart();
 		cancelBoundaryFlush?.();
 		cancelBoundaryFlush = undefined;
@@ -1775,16 +1826,39 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		return confirmation;
 	};
 
+	// A task stored on disk that never reached a terminal state was in flight
+	// when the parent process was abruptly terminated (kill -9, host reboot,
+	// OOM). When loaded into a new process where it has no live runner, it is
+	// reconciled into a terminal failed state and updated on disk (#1741).
+	const reconcileStored = async (stored: StoredTask): Promise<StoredTask> => {
+		if (isFinished(stored.task.status)) return stored;
+		const reconciledTask: TaskRecord = {
+			...stored.task,
+			status: TASK_STATUS.FAILED,
+			error: stored.task.error ?? "interrupted: parent process terminated while task was in flight",
+			lastStep: "interrupted",
+			endedAt: stored.task.endedAt ?? deps.now(),
+		};
+		try { await saveTask(tasksDir, reconciledTask, stored.thread); } catch { /* best effort */ }
+		return { task: reconciledTask, thread: stored.thread };
+	};
+
 	// Tasks from earlier sessions come back from disk on demand.
 	const resolveTask = async (id: string): Promise<TaskRecord | undefined> => {
 		const live = store.get(id);
-		if (live) return live;
+		if (live && !restoredTaskIds.has(id)) return live;
 		const stored = await loadStoredTask(tasksDir, id);
 		if (stored) {
-			restoredTaskIds.add(stored.task.id);
-			store.restore(stored.task, stored.thread);
+			if (!isFinished(stored.task.status) && stored.task.parentSessionId !== activeSessionId()) {
+				return undefined;
+			}
+			const reconciled = await reconcileStored(stored);
+			restoredTaskIds.add(reconciled.task.id);
+			store.restore(reconciled.task, reconciled.thread);
+			store.update(reconciled.task.id, reconciled.task);
+			return reconciled.task;
 		}
-		return stored?.task;
+		return live;
 	};
 
 	// A guessed id ("1") leads back to real ids instead of a dead end, so the
@@ -1815,8 +1889,12 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			// The session may have moved on while disk was read; a stale restore
 			// must never land in the wrong session's store.
 			if (ctx.sessionManager.getSessionId() !== sessionId) return;
-			for (const { task, thread } of history) {
-				if (task.parentSessionId !== sessionId) continue;
+			// An in-flight record has no live runner here, so it is reconciled
+			// before the widget or store can show it as still running (#1741).
+			const own = history.filter(({ task }) => task.parentSessionId === sessionId && !store.get(task.id));
+			const reconciled = await Promise.all(own.map(reconcileStored));
+			if (ctx.sessionManager.getSessionId() !== sessionId) return;
+			for (const { task, thread } of reconciled) {
 				if (store.restore(task, thread)) restoredTaskIds.add(task.id);
 			}
 		} catch { /* Partial history is acceptable; the live session keeps running. */ }
@@ -2303,6 +2381,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				launched = true;
 				const foreign = foreignRequests.get(request);
 				if (foreign && launchedTaskId) foreignTasks.set(launchedTaskId, foreign);
+				if (launchedTaskId) persistLaunch(launchedTaskId);
 			},
 			...(observe ? { canCollectResponseObservations: metrics.valid, prepareResponseObservations: async () => {
 				if (metrics.finished || owner !== metricsOwner || request.parentSessionId !== activeSessionId() || !runtimeMetricsEnvAllows(deps.env)) return false;
@@ -2317,6 +2396,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const foreignRequest = foreignRequests.get(request);
 		if (launched && foreignRequest) foreignTasks.set(task.id, foreignRequest);
 		ownedTaskIds.add(task.id);
+		persistLaunch(task.id);
 		publishWork?.(task.id);
 		publishActivityPrompt(); // Admission's summary notification precedes runtime ownership.
 		refreshHerdrBusy(); // So does the busy raise: ownership lands after that notification.
@@ -2851,8 +2931,16 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	});
 
 	tool("list_tasks", "List the subagent tasks of this session, newest first.", { properties: {} }, async (_params, ctx) => {
-		const tasks = store.list(ctx.sessionManager.getSessionId() ?? "");
-		return text(tasks.length === 0 ? "No subagent tasks in this session." : tasks.map(describeTask).join("\n"));
+		await sessionRestoration;
+		const sessionId = ctx.sessionManager.getSessionId() ?? "";
+		const tasks = store.list(sessionId);
+		for (const task of tasks) {
+			if (!isFinished(task.status) && restoredTaskIds.has(task.id)) {
+				await resolveTask(task.id);
+			}
+		}
+		const reconciledTasks = store.list(sessionId);
+		return text(reconciledTasks.length === 0 ? "No subagent tasks in this session." : reconciledTasks.map(describeTask).join("\n"));
 	});
 
 	tool("reply", "Reply once to a live query from a child of the current parent session.", { required: ["task_id", "request_id", "message"], properties: { task_id: { type: "string" }, request_id: { type: "string" }, message: { type: "string" } } }, async (params, ctx) => {
@@ -2995,7 +3083,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		// resolveTask path for anything else.
 		const sessionId = ctx.sessionManager.getSessionId();
 		const preexisting = event.reason === "resume" || (event.reason === "startup" && ctx.sessionManager.getEntries().length > 0);
-		if (preexisting && sessionId) void restoreSessionHistory(ctx, sessionId);
+		if (preexisting && sessionId) sessionRestoration = restoreSessionHistory(ctx, sessionId);
 		try {
 			presence = startPresence(ctx.sessionManager);
 			resetActivityPublish();
