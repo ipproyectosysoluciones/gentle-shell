@@ -83,6 +83,8 @@ import {
 	normalizeRoutingEntry,
 	readSavedModelConfig as readModelRoutingAuthority,
 	readSavedModelConfigAsync as readModelRoutingAuthorityAsync,
+	readModelConfigFile,
+	readModelConfigFileAsync,
 	type AgentModelConfig,
 	type AgentRoutingEntry,
 	type ModelConfigFileResult,
@@ -1987,17 +1989,20 @@ const HERDR_BLOCKER_LABEL = {
 	CHOICE: "Choice awaiting input",
 	GUARDED_CONFIRMATION: "Guarded command confirmation",
 	QUESTIONNAIRE: "Questionnaire awaiting input",
+	REVIEW_AUTHORIZATION: "Review authorization awaiting input",
 } as const;
 
 type HerdrBlockerLabel = (typeof HERDR_BLOCKER_LABEL)[keyof typeof HERDR_BLOCKER_LABEL];
 
+type HerdrBlockerSource = "guarded-confirmation" | "review-authorization";
+
 type HerdrConfirmationLifecycle = {
-	begin(): void;
-	settle(): void;
+	begin(source?: HerdrBlockerSource): void;
+	settle(source?: HerdrBlockerSource): void;
 };
 
 function createHerdrConfirmationLifecycle(events: ExtensionAPI["events"]): HerdrConfirmationLifecycle {
-	let pending = 0;
+	const pending: Record<HerdrBlockerSource, number> = { "guarded-confirmation": 0, "review-authorization": 0 };
 	let choiceActive = false;
 	let nativeQuestionnaireActive = false;
 	let legacyQuestionnaireActive = false;
@@ -2007,15 +2012,17 @@ function createHerdrConfirmationLifecycle(events: ExtensionAPI["events"]): Herdr
 			? HERDR_BLOCKER_LABEL.CHOICE
 			: nativeQuestionnaireActive || legacyQuestionnaireActive
 				? HERDR_BLOCKER_LABEL.QUESTIONNAIRE
-				: pending > 0
-					? HERDR_BLOCKER_LABEL.GUARDED_CONFIRMATION
-					: undefined;
+				: pending["review-authorization"] > 0
+					? HERDR_BLOCKER_LABEL.REVIEW_AUTHORIZATION
+					: pending["guarded-confirmation"] > 0
+						? HERDR_BLOCKER_LABEL.GUARDED_CONFIRMATION
+						: undefined;
 		// Herdr bridges count active/inactive edges. Keep the first label until
 		// every source releases; relabel activations would leak a blocked count.
 		if ((nextLabel === undefined) === (emittedLabel === undefined)) return;
 		emittedLabel = nextLabel;
-		if (nextLabel === undefined) events.emit("herdr:blocked", { active: false });
-		else events.emit("herdr:blocked", { active: true, label: nextLabel });
+		if (nextLabel === undefined) events?.emit?.("herdr:blocked", { active: false });
+		else events?.emit?.("herdr:blocked", { active: true, label: nextLabel });
 	};
 
 	events?.on?.(ASK_USER_CHOICE_BLOCKED_EVENT, (event) => {
@@ -2037,16 +2044,52 @@ function createHerdrConfirmationLifecycle(events: ExtensionAPI["events"]): Herdr
 	});
 
 	return {
-		begin() {
-			pending += 1;
+		begin(source = "guarded-confirmation") {
+			pending[source] += 1;
 			emitEffectiveBlocker();
 		},
-		settle() {
-			if (pending === 0) return;
-			pending -= 1;
+		settle(source = "guarded-confirmation") {
+			if (pending[source] === 0) return;
+			pending[source] -= 1;
 			emitEffectiveBlocker();
 		},
 	};
+}
+
+const HERDR_BLOCKING_UI_METHODS = new Set<PropertyKey>(["confirm", "select", "input", "editor", "custom"]);
+
+/**
+ * Projects every human-facing dialog opened through this context's UI as one
+ * Herdr blocker interval. Only `ui` is replaced; every other property reads the
+ * original context so its liveness getters keep their own receiver.
+ */
+function withHerdrBlockingUi<T extends ExtensionContext>(ctx: T, herdrLifecycle: HerdrConfirmationLifecycle, source: HerdrBlockerSource): T {
+	let wrappedUi: ExtensionContext["ui"] | undefined;
+	let wrappedTarget: ExtensionContext["ui"] | undefined;
+	return new Proxy(ctx, {
+		get(target, property) {
+			const value: unknown = Reflect.get(target, property, target);
+			if (property !== "ui" || value === null || typeof value !== "object") return value;
+			const ui = value as ExtensionContext["ui"];
+			if (wrappedUi !== undefined && wrappedTarget === ui) return wrappedUi;
+			wrappedTarget = ui;
+			wrappedUi = new Proxy(ui, {
+				get(uiTarget, uiProperty) {
+					const member = Reflect.get(uiTarget, uiProperty, uiTarget);
+					if (!HERDR_BLOCKING_UI_METHODS.has(uiProperty) || typeof member !== "function") return member;
+					return async (...args: unknown[]) => {
+						herdrLifecycle.begin(source);
+						try {
+							return await Reflect.apply(member, uiTarget, args);
+						} finally {
+							herdrLifecycle.settle(source);
+						}
+					};
+				},
+			});
+			return wrappedUi;
+		},
+	});
 }
 
 // gentle-shell#2172: YOLO waives reversible delivery, not only one bare push.
@@ -2384,6 +2427,37 @@ function legacyProjectModelConfigPath(cwd: string): string {
 	return join(cwd, ".pi", "gentle-ai", "models.json");
 }
 
+// bootstrapProfilesFile can activate a profile from a read-only
+// effective-config snapshot without ever writing the global file (e.g.
+// opening /gentle:profiles for the first time). A pinned or active profile is
+// a complete routing snapshot (see withOmittedAgentsClearedAsync): omitted
+// agents must inherit. Before the global file exists there is nothing for the
+// "use only the global file" guarantee to read, and falling back to the raw
+// legacy project file would resurrect agents the profile deliberately omits
+// (that file was never filtered by the profile's omissions). Read the
+// profile's own stored snapshot instead: it is already complete, because
+// bootstrapProfilesFile seeds it from the full effective routing that was
+// visible a moment before the profile existed. Takes the already-resolved
+// target so callers that also branch on it never resolve it twice.
+function activeProfileRoutingSnapshot(cwd: string, target: CurrentProfileTarget): ModelConfigFileResult | undefined {
+	const store = readProfilesFileResult(profilesFilePath(gentleAiConfigHome()));
+	if (store.status !== "valid") return undefined;
+	const config = store.file.profiles[target.name];
+	return config === undefined ? undefined : { status: "valid", config };
+}
+
+// The second path fed into the global/project merge below. With no active
+// profile it is the real legacy project file, so project-only entries merge
+// in. With a pinned or active profile and an existing global file it is the
+// *global* path again on purpose: merging the legacy project file here would
+// resurrect agent entries the profile deliberately omitted (the profile's
+// own snapshot, read by activeProfileRoutingSnapshot, is already complete).
+// Takes the already-resolved target so callers that also branch on it never
+// resolve it twice.
+function secondaryMergeSourcePath(cwd: string, target: CurrentProfileTarget | undefined): string {
+	return target !== undefined ? modelConfigPath(cwd) : legacyProjectModelConfigPath(cwd);
+}
+
 function projectPersonaConfigPath(cwd: string): string {
 	return join(cwd, ".pi", "gentle-ai", "persona.json");
 }
@@ -2422,22 +2496,34 @@ function writePersonaMode(cwd: string, mode: PersonaMode): string[] {
 	return paths;
 }
 
+// An invalid legacy project file must never block the global config it merges
+// with: fall back to the global-only result (or empty) instead of erroring.
 function readSavedModelConfig(cwd: string): ModelConfigFileResult {
-	const projectPath = legacyProjectModelConfigPath(cwd);
-	const result = readModelRoutingAuthority(modelConfigPath(cwd), projectPath);
-	return result.status === "invalid" && result.path === projectPath
-		? { status: "valid", config: {} }
-		: result;
+	const globalPath = modelConfigPath(cwd);
+	const target = resolveCurrentProfileTarget(cwd);
+	if (target !== undefined && !existsSync(globalPath)) {
+		return activeProfileRoutingSnapshot(cwd, target) ?? { status: "valid", config: {} };
+	}
+	const projectPath = secondaryMergeSourcePath(cwd, target);
+	const result = readModelRoutingAuthority(globalPath, projectPath);
+	if (result.status !== "invalid" || result.path !== projectPath || globalPath === projectPath) return result;
+	const globalResult = readModelConfigFile(globalPath);
+	return globalResult.status === "valid" ? globalResult : { status: "valid", config: {} };
 }
 
 async function readSavedModelConfigAsync(
 	cwd: string,
 ): Promise<ModelConfigFileResult> {
-	const projectPath = legacyProjectModelConfigPath(cwd);
-	const result = await readModelRoutingAuthorityAsync(modelConfigPath(cwd), projectPath);
-	return result.status === "invalid" && result.path === projectPath
-		? { status: "valid", config: {} }
-		: result;
+	const globalPath = modelConfigPath(cwd);
+	const target = resolveCurrentProfileTarget(cwd);
+	if (target !== undefined && !existsSync(globalPath)) {
+		return activeProfileRoutingSnapshot(cwd, target) ?? { status: "valid", config: {} };
+	}
+	const projectPath = secondaryMergeSourcePath(cwd, target);
+	const result = await readModelRoutingAuthorityAsync(globalPath, projectPath);
+	if (result.status !== "invalid" || result.path !== projectPath || globalPath === projectPath) return result;
+	const globalResult = await readModelConfigFileAsync(globalPath);
+	return globalResult.status === "valid" ? globalResult : { status: "valid", config: {} };
 }
 
 export function readModelConfig(cwd: string): AgentModelConfig {
@@ -3288,10 +3374,11 @@ export async function applySavedModelConfig(
 	ctx: ExtensionContext,
 	applyConfig: typeof applyModelConfigAsync = applyModelConfigAsync,
 ): Promise<{ updated: number; skipped: number; invalidPath?: string }> {
-	const result = await readModelRoutingAuthorityAsync(
-		modelConfigPath(ctx.cwd),
-		legacyProjectModelConfigPath(ctx.cwd),
-	);
+	const applyGlobalPath = modelConfigPath(ctx.cwd);
+	const applyTarget = resolveCurrentProfileTarget(ctx.cwd);
+	const result = applyTarget !== undefined && !existsSync(applyGlobalPath)
+		? activeProfileRoutingSnapshot(ctx.cwd, applyTarget) ?? { status: "valid" as const, config: {} }
+		: await readModelRoutingAuthorityAsync(applyGlobalPath, secondaryMergeSourcePath(ctx.cwd, applyTarget));
 	if (result.status === "invalid") {
 		return { updated: 0, skipped: 0, invalidPath: result.path };
 	}
@@ -5520,9 +5607,11 @@ async function runProfilesPanelAction(
 			// profile omits, so the dialog must name the concrete diff. The current
 			// routing is read from the same authority every other consumer uses; an
 			// unreadable config is tolerated as empty, exactly like readModelConfigAsync.
+			// Like applySavedModelConfig, an active profile excludes legacy project
+			// routes it omitted, so they never surface as a false clearing diff.
 			const savedRouting = await readModelRoutingAuthorityAsync(
 				modelConfigPath(ctx.cwd),
-				legacyProjectModelConfigPath(ctx.cwd),
+				secondaryMergeSourcePath(ctx.cwd, resolveCurrentProfileTarget(ctx.cwd)),
 			);
 			// The apply pads omitted discoverable agents with clear entries, so the
 			// diff must run against the effective current routing: the saved global
@@ -11164,6 +11253,8 @@ async function executeReviewControllerOperation(
 
 /** @internal */
 export const __testing = {
+	readSavedModelConfig,
+	readSavedModelConfigAsync,
 	setCandidateViewSymlinkProbeForTesting,
 	CandidateViewSymlinkProbeUnavailableError,
 	scanCandidateTreeForSymlinks,
@@ -11675,6 +11766,8 @@ function createGentleAiExtensionForTesting(
 		},
 		async execute(_toolCallId, parameters, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw reviewCancellation("Review controller operation was cancelled");
+			// Every review authorization dialog blocks the agent on the human.
+			ctx = withHerdrBlockingUi(ctx, herdrLifecycle, "review-authorization");
 			await authorizeDestructiveReviewOperation(parameters, ctx);
 			const sessionKey = pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey);
 			const retainedSelections = processRetainedNativeStatusSelections.get(sessionKey)
