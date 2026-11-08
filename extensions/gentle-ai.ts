@@ -8,6 +8,7 @@ import { defaultTempScratchFs, isTempScratchRemoval, type TempScratchFs } from "
 import { SHELL_COMMAND_TOOLS } from "../lib/background-jobs.ts";
 import { evaluateDeliveredTestTool } from "../lib/delivered-test-lint.ts";
 import { commitSliceToolResult } from "../lib/commit-slice-signal.ts";
+import { checkReviewDeliveryPreflight } from "../lib/review-delivery-preflight.ts";
 import { appendContextBackstopNotice, createContextBackstopSignal, createThrottledContextMeasure } from "../lib/context-backstop.ts";
 import { createExplorationBudget } from "../lib/exploration-budget.ts";
 import { REPLY_LANGUAGE_ANCHOR_TYPE, isHumanInput, replyLanguageAnchorFor } from "../lib/reply-language-anchor.ts";
@@ -818,11 +819,18 @@ function renderRddStatusLine(
 // start, so an unbounded native read would stall session start behind a
 // hung `gentle-ai` child (gentle-pi#661 native-review escalation). The
 // production call site (before_agent_start) passes
-// `AbortSignal.timeout(RDD_STATUS_TIMEOUT_MS)`; resolveRddModeStatus also
+// a bounded `AbortSignal.timeout` (3000 ms by default); resolveRddModeStatus also
 // races the call against that same signal itself (not just the CLI's own
 // signal handling) so an abort is honored even against a stub/mock
 // reviewMode that ignores its `signal` argument, as tests do.
 const RDD_STATUS_TIMEOUT_MS = 3000;
+const RDD_STATUS_TIMEOUT_MAX_MS = 10_000;
+function resolveRddStatusTimeoutMs(environment: NodeJS.ProcessEnv): number {
+	const value = environment.GENTLE_PI_RDD_STATUS_TIMEOUT_MS;
+	if (value === undefined || !/^[1-9]\d*$/.test(value)) return RDD_STATUS_TIMEOUT_MS;
+	const parsed = Number(value);
+	return Number.isSafeInteger(parsed) && parsed <= RDD_STATUS_TIMEOUT_MAX_MS ? parsed : RDD_STATUS_TIMEOUT_MS;
+}
 // Repeated session/agent-start builds within this window reuse the last
 // resolved status instead of respawning the native binary. Deliberately
 // memoizes a failed/undefined resolution too (a sustained outage should not
@@ -936,24 +944,29 @@ async function readRddModeStatusWithCause(
 	nativeReviewCli: Pick<NativeReviewCli, "reviewMode"> | null | undefined,
 	cwd: string,
 	signal?: AbortSignal,
+	timeoutMs = RDD_STATUS_TIMEOUT_MS,
 ): Promise<{ readonly status: NativeReviewModeStatus } | { readonly cause: string }> {
 	if (!nativeReviewCli?.reviewMode) return { cause: "the native gentle-ai review CLI is not available" };
 	try {
+		signal?.throwIfAborted();
 		const call = nativeReviewCli.reviewMode({ cwd, operation: NATIVE_REVIEW_MODE_OPERATION.STATUS, signal });
 		const result = signal === undefined ? await call : await Promise.race([call, rddAbortRejection(signal)]);
+		signal?.throwIfAborted();
 		return { status: result.status };
 	} catch (error) {
-		return { cause: describeRddStatusFailure(error, signal) };
+		return { cause: describeRddStatusFailure(error, signal, timeoutMs) };
 	}
 }
 
 const RDD_STATUS_CAUSE_LIMIT = 300;
 
-function describeRddStatusFailure(error: unknown, signal: AbortSignal | undefined): string {
+function describeRddStatusFailure(error: unknown, signal: AbortSignal | undefined, timeoutMs: number): string {
 	const command = "native `gentle-ai review mode status`";
-	if (signal?.aborted || (error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.TIMEOUT)) {
-		return `${command} did not answer within ${RDD_STATUS_TIMEOUT_MS} ms`;
+	if (signal?.aborted && signal.reason?.name !== "TimeoutError") return `${command} was cancelled`;
+	if (signal?.aborted) {
+		return `${command} did not answer within ${timeoutMs} ms`;
 	}
+	if (error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.TIMEOUT) return `${command} reported a native timeout`;
 	if (error instanceof NativeReviewCliError) {
 		const exit = error.diagnostics.exit_code === undefined ? "" : `, exit ${error.diagnostics.exit_code}`;
 		const detail = (error.diagnostics.stderr ?? "").replace(/\s+/g, " ").trim() || error.message;
@@ -1220,6 +1233,7 @@ async function resolveRddModeStatus(
 	signal?: AbortSignal,
 	now: () => number = Date.now,
 	ctx?: Pick<ExtensionContext, "hasUI" | "ui">,
+	timeoutMs = RDD_STATUS_TIMEOUT_MS,
 ): Promise<NativeReviewModeStatus | undefined> {
 	const nowMs = now();
 	const cached = rddStatusMemo.get(cwd);
@@ -1227,7 +1241,7 @@ async function resolveRddModeStatus(
 	const generation = rddStatusGeneration(cwd);
 	// An off loadout suppresses mandatory assessment, so only a fresh off read
 	// can retain it. Known-on and unknown lines keep their existing memo policy.
-	const outcome = await readRddModeStatusWithCause(nativeReviewCli, cwd, signal);
+	const outcome = await readRddModeStatusWithCause(nativeReviewCli, cwd, signal, timeoutMs);
 	// Neither cache nor return an obsolete read: in particular, an old off
 	// must never suppress review guidance after an explicit mode change.
 	if (rddStatusGeneration(cwd) !== generation) return undefined;
@@ -1298,8 +1312,9 @@ async function resolveRddStatusLine(
 	signal?: AbortSignal,
 	now: () => number = Date.now,
 	ctx?: Pick<ExtensionContext, "hasUI" | "ui">,
+	timeoutMs = RDD_STATUS_TIMEOUT_MS,
 ): Promise<string> {
-	return renderRddStatusLine(await resolveRddModeStatus(nativeReviewCli, cwd, signal, now, ctx));
+	return renderRddStatusLine(await resolveRddModeStatus(nativeReviewCli, cwd, signal, now, ctx, timeoutMs));
 }
 
 // full-delegation-mode S1/S3/S4: the always-on core carries exactly ONE workflow
@@ -10634,7 +10649,20 @@ async function executeReviewControllerOperationImpl(
 		// authorizeDestructiveReviewOperation (it returns early for any
 		// operation that is neither RESET nor a maintenance operation).
 		const input = parseReviewAssessInput(parameters.operation, parameters.input);
-		const details = await resolveReviewAssessmentPlan(nativeReviewCli, defaultCwd, input, signal, context?.sessionManager as ReceiptSession | undefined);
+		// Pin only a valid committed selector. Delivery obtains a fresh verdict,
+		// but new commits must not move a selected HEAD/branch base forwards.
+		let canonicalBaseRef: string | undefined;
+		if (input.baseRef !== undefined && input.committedOnly === true) {
+			try {
+				const commit = resolveCanonicalCandidateBase(defaultCwd, input.baseRef).commit;
+				if (/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(commit)) canonicalBaseRef = commit;
+			} catch { /* The normal assessment below reports the unresolved selection. */ }
+		}
+		const details = await resolveReviewAssessmentPlan(nativeReviewCli, defaultCwd,
+			canonicalBaseRef === undefined ? input : { ...input, baseRef: canonicalBaseRef }, signal, context?.sessionManager as ReceiptSession | undefined);
+		if (canonicalBaseRef !== undefined && details.candidate?.kind === "base-diff" && details.candidate.baseRef === canonicalBaseRef) {
+			retainedUntrackedSelections.retainCommittedRange(defaultCwd, canonicalBaseRef);
+		}
 		return { operation: parameters.operation, ...details, ...(includeWorkspaceRoot ? { workspace_root: defaultCwd } : {}) };
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.REPAIR_LEGACY_ALIAS) {
@@ -11748,6 +11776,7 @@ export const __testing = {
 	resolveRddModeStatus,
 	resolveRddStatusLine,
 	RDD_STATUS_TIMEOUT_MS,
+	resolveRddStatusTimeoutMs,
 	RDD_STATUS_MEMO_TTL_MS,
 	clearRddStatusMemoForTesting,
 	async startupNegotiationSettled(): Promise<void> {
@@ -12329,14 +12358,26 @@ function createGentleAiExtensionForTesting(
 						if (initialEpoch !== undefined && confirmedIdentity !== undefined && sameReviewSessionIdentity(initialIdentity, confirmedIdentity) && reviewSessionPermissionEpoch(confirmedIdentity) === initialEpoch) {
 							const answer = selection.kind === "provider" ? selection.answer : "granted";
 							details = await answerPendingConsent(answer);
-							if (!permissionAlreadyActive && selection.kind === "host-session" && completedGrantedReviewConsent(details)) {
-								if (grantReviewSessionPermission(confirmedIdentity, initialEpoch)) {
+							if (!permissionAlreadyActive && selection.kind === "host-session") {
+								const started = completedGrantedReviewConsent(details);
+								const grantedIdentity = started
+									? await capturePermissionIdentity(ctx, permissionWorkspaceRoot) : undefined;
+								const liveSession = reviewSessionManagerAndId(ctx);
+								if (!started) {
+									try { ctx.ui.notify("Review session permission was not stored because the native response did not confirm an eligible review start. Later candidates will ask again.", "warning"); } catch { /* Best effort. */ }
+								} else if (grantedIdentity === undefined || !sameReviewSessionIdentity(confirmedIdentity, grantedIdentity) ||
+									liveSession?.manager !== grantedIdentity.sessionManager || liveSession.sessionId !== grantedIdentity.sessionId ||
+									reviewSessionPermissionEpoch(grantedIdentity) !== initialEpoch) {
+									try { ctx.ui.notify("Review session permission was not stored because the session or repository changed while the review was starting. Later candidates will ask again.", "warning"); } catch { /* Best effort. */ }
+								} else if (grantReviewSessionPermission(grantedIdentity, initialEpoch)) {
 									setReviewSessionPermissionStatus(ctx, true);
 									try { ctx.ui.notify("Reviews are allowed for this Pi session and this Git repository.", "info"); } catch { /* Nonblocking indication only. */ }
 								} else {
 									try { ctx.ui.notify("This review started, but the in-memory session permission registry was incompatible, so later candidates will ask again.", "warning"); } catch { /* Best effort. */ }
 								}
 							}
+						} else if (!permissionAlreadyActive && selection.kind === "host-session") {
+							try { ctx.ui.notify("Review session permission was not stored because the session or repository changed while consent was open. Reopen review consent for the current session.", "warning"); } catch { /* Best effort. */ }
 						}
 					}
 				}
@@ -12567,10 +12608,11 @@ function createGentleAiExtensionForTesting(
 		// reviewContractPrompt condition below -- named agents never reach
 		// this branch, so no line is resolved or computed for them.
 		// resolveRddStatusLine never throws and never hangs past
-		// RDD_STATUS_TIMEOUT_MS: an absent/timed-out/aborted/failing native
+		// the configured bounded deadline: an absent/timed-out/aborted/failing native
 		// binary keeps the last known line for this cwd, or renders the
 		// fail-closed "unknown" line when none was ever read (gentle-shell#1029).
-		const rddStatusSignal = AbortSignal.timeout(RDD_STATUS_TIMEOUT_MS);
+		const rddStatusTimeoutMs = resolveRddStatusTimeoutMs(permissionEnvironment);
+		const rddStatusSignal = AbortSignal.timeout(rddStatusTimeoutMs);
 		const promptCwd = ctx.cwd;
 		const promptEpoch = reminderEpoch;
 		const promptManager = ctx.sessionManager;
@@ -12589,7 +12631,7 @@ function createGentleAiExtensionForTesting(
 		}
 		const promptGeneration = rddStatusGeneration(promptCwd);
 		const nextRddStatusLine = isPrimarySession
-			? await resolveRddStatusLine(nativeReviewCli, promptCwd, rddStatusSignal, undefined, ctx)
+			? await resolveRddStatusLine(nativeReviewCli, promptCwd, rddStatusSignal, undefined, ctx, rddStatusTimeoutMs)
 			: undefined;
 		if (!currentPrompt()) {
 			updateYoloPrompt(event.systemPromptOptions, false, false);
@@ -12636,8 +12678,9 @@ function createGentleAiExtensionForTesting(
 		// and forwards only systemPromptOptions, so the harness is delivered
 		// through the mutable appendSystemPrompt section instead of a replacement.
 		appendSystemPromptOnce(event.systemPromptOptions, `${gentlePrompt}${reviewContractPrompt}`);
-		updateYoloPrompt(event.systemPromptOptions, isPrimarySession && await yolo.active(ctx), isPrimarySession && await yolo.superActive(ctx));
-		updateAutoPrompt(event.systemPromptOptions, isPrimarySession && await yolo.mode(ctx) === "auto");
+		const promptMode = isPrimarySession ? await yolo.mode(ctx) : "normal";
+		updateYoloPrompt(event.systemPromptOptions, promptMode === "yolo", promptMode === "super-yolo");
+		updateAutoPrompt(event.systemPromptOptions, promptMode === "auto");
 		return undefined;
 	});
 
@@ -12853,7 +12896,7 @@ function createGentleAiExtensionForTesting(
 			return { block: true, reason: "Permission mode changed during tool admission. This action was not run; retry under the current mode." };
 		}
 		const autoGate = permissionMode === "auto" ? gate : undefined;
-		return await evaluateBashPolicies(
+		const commandDenied = await evaluateBashPolicies(
 			command,
 			ctx,
 			pi.events,
@@ -12863,6 +12906,16 @@ function createGentleAiExtensionForTesting(
 			autoGate,
 			superYoloActive,
 		);
+		if (commandDenied) return commandDenied;
+		// Check after any command-authorization dialog, so the human's wait
+		// cannot leave an earlier candidate assessment stale at execution.
+		const sessionKey = pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey), deliveryEpoch = reminderEpoch;
+		const deliveryDenied = await checkReviewDeliveryPreflight(ctx.cwd, event.toolName, command, nativeReviewCli,
+			root => processRetainedNativeStatusSelections.get(sessionKey)?.readCommittedRange(root),
+			(root, target) => readNativeReviewOutcome(root, target) === "declined", ctx.signal,
+			() => deliveryEpoch === reminderEpoch && modeEpoch === yolo.epoch() && pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey) === sessionKey);
+		if (primaryToolCall && modeEpoch !== yolo.epoch()) return { block: true, reason: "Permission mode changed during delivery preflight. This action was not run; retry under the current mode." };
+		return deliveryDenied;
 	});
 
 	for (const owner of ["delegation", "review"] as const) {
