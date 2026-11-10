@@ -171,7 +171,7 @@ otherwise `herdr` from `PATH`, without a shell.
 | **Agent overlay close control** | Adds a header close button that adapts to available width. |
 | **Reviewer protection**        | Surfaces review workload risk before a task turns into an oversized PR.                                                                       |
 | **Per-agent model assignment** | Pi-native modal for assigning stronger or cheaper models to packaged and custom agents.                                                       |
-| **Skill discovery registry**   | Maintains `.atl/skill-registry.md` from project and user skills so review/comment/PR workflows do not silently miss the right skill.          |
+| **Skill discovery registry**   | Maintains a shared disk index and a separate Pi session-effective view for selecting and delegating exact skill paths. |
 | **Skill creation workflow**    | Provides the `gentle-ai-skill-creator`/`gentle-ai-skill-improver` skills, `/skill-creation` prompt, and packaged style guide for LLM-first skills. |
 | **Delivery skills**            | Includes issue-first PRs, chained PRs, work-unit commits, cognitive docs, comment writing, and Judgment Day review.                           |
 | **Bounded native review**      | Freezes one candidate, dispatches only controller-selected lenses, and records native authority. Review outcomes are informational; delivery follows ordinary repository policy. |
@@ -960,7 +960,7 @@ Saved model routing is applied separately; these installation commands do not ch
 .atl/skill-registry.md
 ```
 
-The registry scans project and user skill roots, not package-owned skills. It exists to catch workflow skills that are present on disk but not visible in Pi's injected skill list.
+The shared registry indexes disk roots only, not session-only package or custom skills. On each enabled primary-session agent start, Pi also exposes an **effective session skills** block combining the current disk scan with that session's runtime-resolved skills. Select and delegate from that view: neither the shared file nor Pi's injected skill list alone is complete. A disk change appears in the view at the next agent start, not mid-run.
 
 It scans common roots such as:
 
@@ -969,6 +969,7 @@ It scans common roots such as:
 .opencode/skills
 .claude/skills
 .gemini/skills
+.trae/skills
 .cursor/skills
 .github/skills
 .codex/skills
@@ -979,15 +980,20 @@ It scans common roots such as:
 .agent/skills
 .agents/skills
 .atl/skills
+.hermes/skills
 ~/.pi/agent/skills
 ~/.config/agents/skills
 ~/.agents/skills
+~/.kimi-code/skills
 ~/.kimi/skills
 ~/.config/opencode/skills
 ~/.config/kilo/skills
 ~/.claude/skills
 ~/.gemini/skills
+~/.gemini/config/skills
 ~/.gemini/antigravity/skills
+~/.gemini/antigravity-desktop/skills
+~/.gemini/antigravity-cli/skills
 ~/.cursor/skills
 ~/.copilot/skills
 ~/.codex/skills
@@ -995,7 +1001,11 @@ It scans common roots such as:
 ~/.qwen/skills
 ~/.kiro/skills
 ~/.openclaw/skills
+~/.hermes/skills
+~/.trae/skills
 ```
+
+A valid `CODEX_HOME` replaces `~/.codex` for the Codex root; relative values resolve against the process cwd. Shared bytes converge when upgraded Pi and Gentle AI writers use the same cwd, home, effective `CODEX_HOME`, filesystem snapshot, and OS. Different homes and mixed old/new versions are outside that guarantee; upgrade both writers first.
 
 Behavior:
 
@@ -1003,9 +1013,10 @@ Behavior:
 - the registry refreshes on session start, but automatic writes (including watcher refreshes) preserve Git-tracked targets;
 - skipped writes warn with the protected paths and `/skill-registry:refresh` as the deliberate regeneration path; Git detection failures skip automatic writes rather than assuming files are untracked;
 - startup refresh is skipped when Pi starts with `--no-skills` / `-ns`, `--no-skill-registry`, or `GENTLE_PI_NO_SKILL_REGISTRY=1`;
-- `/skill-registry:refresh` intentionally regenerates the registry and cache and updates the child ignore, even when tracked; review the resulting Git diff;
-- a best-effort watcher refreshes when skill files change;
-- the registry indexes skill names, full descriptions, scope, and exact `SKILL.md` paths without copying skill body rules.
+- `/skill-registry:refresh` deliberately overrides tracked-target protection and updates the child ignore; review the resulting Git diff. It recomputes from disk but does not rewrite byte-identical registry or cache files;
+- a best-effort watcher refreshes when skill files change; the cache is a non-authoritative SHA-256 hint, and each refresh compares actual rendered and on-disk bytes;
+- each file is published atomically, registry before cache; they are not an atomic pair, and a later refresh repairs a mismatch;
+- the registry indexes skill names, descriptions, scope, and exact `SKILL.md` paths without copying skill body rules or runtime-only rows.
 
 Skill discovery is a guardrail, not a workflow router: it helps Pi load the right skill without forcing extra ceremony.
 
@@ -1017,7 +1028,7 @@ Compatibility: the package keeps the existing skill folders (`skills/branch-pr`,
 
 Delegation contract:
 
-- parent/orchestrator resolves project/user skills from the registry and passes matching paths under `## Skills to load before work`;
+- parent/orchestrator selects project/user and runtime skills from the effective session view and passes matching exact paths under `## Skills to load before work`;
 - during normal runtime, subagents should not independently discover additional project/user `SKILL.md` files or the registry;
 - fallback loading is degraded self-healing and must be reported via `skill_resolution` as `fallback-registry`, `fallback-path`, or `none`.
 
@@ -1211,7 +1222,7 @@ On the models screen, `w` toggles the shown profile's mode and `s` saves it toge
 
 The mode travels with the profile and is resolved on every prompt build, so switching profiles changes the orchestrator's rules on the next turn in both directions, with no restart. It is stored beside the profiles in `profiles.json`, under `workflow` keyed by profile name: `organic` needs no entry, so a profile that never opted in serializes exactly as before, and only a `full-delegation` mode is written. `GENTLE_PI_ORCHESTRATOR_MODE=organic|full-delegation` overrides the profile for the process, which is meant for CI and headless runs.
 
-Full delegation is a deliberate trade-off for an expensive orchestrator paired with very light workers, for example DeepSeek Flash or a local model: every authorized change goes to a worker, small ones included, so expect a few times the wall time of organic on small tasks. In the #1494 three-fix fixture (2026-11-10, n=3 sequential runs per arm, bare Pi median 47.4 s), organic took about 1.1-1.2x the wall time of bare Pi. Full delegation in its intended setup, with orchestrator `openai-codex/gpt-6-astra` at `medium` and every worker role on `nan/deepseek-v4-flash`, took about 3.2x. That is half the time of the heavy-worker setup, but three serial worker round trips plus the orchestrator's own turns set a floor, and the orchestrator dominates cost: about $0.58 per run against about $0.10 for organic (Pi's parent-side estimate; NaN workers are unpriced). With workers heavier than the orchestrator (`openai-codex/gpt-6.1-sol` at `low`, workers `openai/gpt-6.1-terra` at `max`) it took about 7x. See the [measurement report](../odd/tasks/1494-overhead-measurement.md). For full delegation, give the worker roles lighter models and effort than the orchestrator; prefer organic, on the profile or for one run with `GENTLE_PI_ORCHESTRATOR_MODE=organic`, when small-task latency matters. The profile's `orchestrator` entry moves the live session when you select the profile in `/gentle:profiles`, and **Make default** writes it to `settings.json` for new sessions. A repo profile pin routes roles only, so under a pin the orchestrator stays the session model from `settings.json`, and `--model` (for example in a `-p` run) overrides it for that run.
+Full delegation is a deliberate trade-off for an expensive orchestrator paired with light workers, for example DeepSeek Flash or a local model: every authorized change goes to a worker, small ones included, so expect a few times the wall time of organic on small tasks. In the #1494 three-fix fixture (2026-11-10, n=3 sequential runs per arm, bare Pi median 45.5 s and about $0.036 per run, Pi catalog cost estimates), organic took about 1.2x the wall time at about $0.10 per run. With the orchestrator held at `openai-codex/gpt-6-astra` at `medium`, full delegation took about 3.9x and about $0.66 per run with `openai/gpt-6.1-terra` at `max` workers (orchestrator $0.59, workers $0.05), and about 3.4x and at least $0.58 per run with `nan/deepseek-v4-flash` workers (NaN models are unpriced, so that is a floor). The orchestrator is about 90% of the cost because it carries the always-on prompt for 9-13 turns, so lighter workers save some time (about 24 s here) but little money, and on small tasks only organic stayed within 1.5x of bare Pi. See the [measurement report](../odd/tasks/1494-overhead-measurement.md). For full delegation, give the worker roles lighter models and effort than the orchestrator; prefer organic, on the profile or for one run with `GENTLE_PI_ORCHESTRATOR_MODE=organic`, when small-task latency or cost matters. The profile's `orchestrator` entry moves the live session when you select the profile in `/gentle:profiles`, and **Make default** writes it to `settings.json` for new sessions. A repo profile pin routes roles only, so under a pin the orchestrator stays the session model from `settings.json`, and `--model` (for example in a `-p` run) overrides it for that run.
 
 The mode changes the runtime as well as the prompt, so the two never disagree:
 
@@ -1246,7 +1257,7 @@ When a run's final response fails, its error category decides:
 - `rate_limit`, `provider_unavailable`, `timeout` and `network` move on too. Pi already retried them on the same model before the run failed.
 - `context_length`, `invalid_request`, unknown errors and aborts never move on, because another model would fail the same way.
 
-The orchestrator uses its `orchestrator` chain once the run settles (after Pi's own retries; a run you abort never moves on): the session switches to the next model (and its effort) and a follow-up message resumes the work; a model Pi refuses or cannot log in to is skipped. The chain is walked once per episode, which ends when a turn succeeds. A subagent switches its live child to the next model (`set_model`, plus the step's effort, or the agent's configured effort when the step has none) and is asked to continue the same conversation, so finished steps are not repeated. A model that failed is skipped by every agent of the session for a while: 30 minutes after a limit or auth error, 2 minutes after a transient one. A launch whose primary model is cooling down starts on the first usable fallback. When `/gentle:usage` reads a spent limit, the model it names waits until that limit resets (providers such as NaN report one limit per model), and the whole provider waits only when every one of its limits is spent, until the earliest reset; so a subagent starts on its next fallback instead of failing first. A later reading with room releases the provider; a model cooled by its own spent limit waits until that limit resets. A full window whose reset already passed is treated as stale. A limit that covers the whole provider (Codex's main limit) holds every model of it while spent; other limits name one model (NaN reports one per model, Codex extras use display names such as `GPT-5.3 Codex_Spark`, matched as `gpt-5.3-codex-spark`). Each switch shows a warning naming the agent, the reason, the new model and, when it costs more, how much (`2.0x the price`), and is recorded in the session as `gentle-pi.model-fallback/v1`; the agent's row in the sidebar then reads `↪ <task> · <model>`, the model shown when the rail has room (failed rows keep their failure note instead). Only models you put in a chain are ever used; when the chain runs out, the run fails as before.
+The orchestrator uses its `orchestrator` chain once the run settles (after Pi's own retries; a run you abort never moves on): the session switches to the next model (and its effort) and a follow-up message resumes the work; a model Pi refuses or cannot log in to is skipped. The chain is walked once per episode, which ends when a turn succeeds. A subagent switches its live child to the next model (`set_model`, plus the step's effort, or the agent's configured effort when the step has none) and is asked to continue the same conversation, so finished steps are not repeated. A model that failed is skipped by every agent of the session for a while: 30 minutes after a limit or auth error, 2 minutes after a transient one. A launch whose primary model is cooling down starts on the first usable fallback. When `/gentle:usage` reads a spent limit, the model it names waits until that limit resets, and the whole provider waits only when every one of its limits is spent, until the earliest reset; so a subagent starts on its next fallback instead of failing first. A later reading with room releases the provider; a model cooled by its own spent limit waits until that limit resets. A full window whose reset already passed is treated as stale. A limit that covers the whole provider (Codex's main limit) holds every model of it while spent; other limits name one model (Codex extras use display names such as `GPT-5.3 Codex_Spark`, matched as `gpt-5.3-codex-spark`). NaN's per-model token quota is advisory and never cools a NaN model or the provider down; a real NaN quota or rate-limit error still does. Each switch shows a warning naming the agent, the reason, the new model and, when it costs more, how much (`2.0x the price`), and is recorded in the session as `gentle-pi.model-fallback/v1`; the agent's row in the sidebar then reads `↪ <task> · <model>`, the model shown when the rail has room (failed rows keep their failure note instead). Only models you put in a chain are ever used; when the chain runs out, the run fails as before.
 
 ### Per-repository pins
 
