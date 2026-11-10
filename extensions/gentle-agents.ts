@@ -77,6 +77,8 @@ import { allowedEditSurfaces, inheritAllowedEditSurfaces, isBoundedWriter, isDev
 import { CHILD_METRICS_EVENT, CHILD_METRICS_REVOKED, childEvent, launchSelection, type LaunchSelection } from "../lib/runtime-metrics-children.ts";
 import { runtimeMetricsEnvAllows, type RuntimeMetricsPolicyDeps } from "../lib/runtime-metrics-policy.ts";
 import { publishTaskStatusChanges } from "../lib/notification-events.ts";
+import { appendSystemPromptOnce } from "../lib/append-system-prompt.ts";
+import { codemodeReaches, COORDINATION_TOOLS_ROUTE, hideBehindCodemode } from "../lib/hidden-tools.ts";
 
 // Gentle Agents: subagents as isolated `pi --mode rpc` children, a task
 // store that notifies per task, and a Gentle Shell card above the editor.
@@ -1710,8 +1712,10 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	// compaction ran inside or right before the run. `before_agent_start`
 	// marks a prompt that is about to start a run, and the compaction events
 	// release content held while the parent compacted without a run.
-	pi.on("before_agent_start", () => {
+	pi.on("before_agent_start", (event) => {
 		if (!parentRunActive) beginPromptStart();
+		const options = event?.systemPromptOptions;
+		if (codemodeReaches(options?.selectedTools) && ["orchestrator_list", "orchestrator_consult", "orchestrator_send_message"].some((name) => options?.selectedTools?.includes(name))) appendSystemPromptOnce(options, COORDINATION_TOOLS_ROUTE);
 	});
 	pi.on("agent_start", () => {
 		activeAgentRuns += 1;
@@ -2792,6 +2796,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	pi.registerTool({
 		name: "orchestrator_consult",
 		label: "Consult published context",
+		prepareLoadout: hideBehindCodemode("orchestrator_consult"),
 		...orchestratorToolRenderers("consult", expandHint),
 		description: "Read published metadata (default), request bounded helper reasoning with explicit UI model-cost permission and a question, or revoke-reasoning for an exact target. Never an owner reply, consent or private context access.",
 		parameters: { type: "object", additionalProperties: false, required: ["recipient_session_id"], properties: {
@@ -2842,6 +2847,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	pi.registerTool({
 		name: "orchestrator_list",
 		label: "List orchestrators",
+		prepareLoadout: hideBehindCodemode("orchestrator_list"),
 		...orchestratorToolRenderers("list", expandHint),
 		description: "List other sessions advertised by the trusted local profile. Omit filter for the existing list; filter searches published classified work only: bounded, non-exhaustive, no authority, unknown reachability. Classified work must publish at session start and each task-topic change; flag peers doing classified work who never published state.",
 		parameters: Type.Object({
@@ -2922,6 +2928,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	pi.registerTool({
 		name: "orchestrator_send_message",
 		label: "Send orchestrator message",
+		prepareLoadout: hideBehindCodemode("orchestrator_send_message"),
 		renderShell: "self",
 		renderCall(args, theme, context) {
 			return outgoingMessageCall(args as { message?: unknown }, theme, context, expandHint(context.expanded));
@@ -3007,18 +3014,18 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 
 	tool(
 		"run",
-		"Delegate a task to a named subagent. Admission rejects writers without repository-relative paths under `## Allowed edit surfaces`; below the context backstop, organic writers without `Spec: odd/tasks/<existing>.md, T<n>` and `gentle-ai-verify` without that or `Risk: item N`.",
+		"Delegate a task to a named subagent. Admission rejects writers without repository-relative `## Allowed edit surfaces`; below the context backstop, organic writers without `Spec: odd/tasks/<existing>.md, T<n>` (2+ disjoint writers alone in one message pass) and `gentle-ai-verify` without that or `Risk: item N`.",
 		{
 			required: ["agent", "task"],
 			properties: {
 				agent: { type: "string", description: "Subagent name from subagent_list_agents." },
 				task: { type: "string", description: "What the subagent must do, self-contained." },
-				label: { type: "string", description: "Three to six words naming the work, shown on the agents card, e.g. 'map footer data sources'." },
+				label: { type: "string", description: "Three to six words naming the work for the agents card, e.g. 'map footer data sources'." },
 				context: { type: "string", description: "Optional extra context appended to the task." },
 				work: workDescriptorSchema,
-				workspace_root: { type: "string", description: "Optional canonical main or linked Git worktree within the parent's same clone only; mutually exclusive with repository_root." },
-				repository_root: { type: "string", description: "Optional canonical independent Git repository; requires direct interactive session-scoped consent before queueing; mutually exclusive with workspace_root." },
-				mode: { type: "string", enum: ["task", "background"], description: "task waits for the result (default); background returns a task id immediately." },
+				workspace_root: { type: "string", description: "Optional canonical main or linked Git worktree within the parent's clone only; exclusive with repository_root." },
+				repository_root: { type: "string", description: "Optional canonical independent Git repository; needs direct interactive session-scoped consent before queueing; exclusive with workspace_root." },
+				mode: { type: "string", enum: ["task", "background"], description: "task waits for the result (default); background returns a task id at once." },
 			},
 		},
 		async (params, ctx, signal) => {
