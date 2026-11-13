@@ -11,9 +11,11 @@
 // each size frame's own overflow in canvas-sizes.js, whose setOverflow is the only way
 // canvas-messages.js and canvas-focus.js change an overflow; board.generation in canvas-sizes.js,
 // whose resized is the only way canvas-focus.js changes it; each size frame's own rects
-// in canvas-sizes.js, canvas-messages.js and canvas-boards.js; compare.loaded in canvas-compare.js). Comments, handoffs and parts are plain data
+// in canvas-sizes.js, canvas-messages.js and canvas-boards.js; compare.loaded in canvas-compare.js; board.checks, the
+// artboard's last accessibility checks, in canvas-checks.js, whose setChecks is the only function that changes them:
+// canvas-messages.js and canvas-sizes.js reach it through checksFrom and checksLoaded). Comments, handoffs and parts are plain data
 // with no such owner, so setComments, setHandoffs and setParts freeze them once, when they
-// are set (never on read): changing them means setting new values.
+// are set (never on read): changing them means setting new values. setTokens does the same for the design tokens.
 
 // The first view sits FIT_PADDING (canvas-view.js) from the viewport's top left.
 const START_OFFSET = 48;
@@ -54,6 +56,12 @@ export function createStore(initial = {}) {
 		handoffs: freezeHandoffs({ slug: null, chosen: null, handoffs: {} }),
 		// The parts.json of design `slug` (canvas-parts.js); the panel lists them only while that design shows.
 		parts: freezeParts({ slug: null, parts: [] }),
+		// The design tokens of design/system.md (canvas-tokens.js): [{ name, value, section, group }].
+		tokens: freezeTokens([]),
+		// Technical details (the rail's Settings): Comment mode shows the token inspector while it is on.
+		technical: false,
+		// The panel's tab (canvas-checks.js): "comments" or "quality".
+		tab: "comments",
 		// The open Compare view: { board, preview, artboardFrame, timer }.
 		compare: null,
 		toastTimer: 0,
@@ -98,6 +106,9 @@ export function createStore(initial = {}) {
 		setHandoffs(handoffs) { state.handoffs = freezeHandoffs(handoffs); },
 		/** The parts of one design: `{ slug, parts }`. */
 		setParts(parts) { state.parts = freezeParts(parts); },
+		setTokens(tokens) { state.tokens = freezeTokens(tokens); },
+		setTechnical(on) { state.technical = on; },
+		setTab(tab) { state.tab = tab; },
 		setCompare(compare) { state.compare = compare; },
 		setToastTimer(timer) { state.toastTimer = timer; },
 		/** The open shared menu, or null when none is open. */
@@ -132,6 +143,12 @@ function freezeParts(parts) {
 		freezeObject(parts.parts);
 	}
 	return freezeObject(parts);
+}
+
+/** Freezes the token list and each token, so only setTokens changes them. */
+function freezeTokens(tokens) {
+	if (Array.isArray(tokens)) tokens.forEach(freezeObject);
+	return freezeObject(tokens);
 }
 
 function freezeObject(value) {
