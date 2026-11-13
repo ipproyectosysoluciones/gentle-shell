@@ -582,12 +582,12 @@ test("E4: the client's viewport limits and the Phone and Tablet presets match wh
 	assert.deepEqual(named, client, "the server names the same sizes the card names");
 });
 
+// Its strings go through ctx.i18n, checked against canvas-i18n-es.js in tests/design-canvas-i18n.test.ts.
 test("All sizes keeps the module rules: state through the store, board fields documented, English strings in TEXT", () => {
 	const sizes = read("canvas-sizes.js");
 	assert.ok(sizes.indexOf("const TEXT = Object.freeze({") < sizes.indexOf("export function init"), "the strings sit in one TEXT block before init");
 	for (const literal of ["All sizes", "Overflows", "Made at"]) assert.ok(sizes.slice(0, sizes.indexOf("export function init")).includes(literal), `${literal} is in TEXT`);
 	assert.ok(!/\bstate\.size\s*=(?!=)/.test(sizes));
-	assert.ok(!/data-i18n|\bloc\(|\bt\(/.test(sizes));
 	assert.match(sizes, /setAttribute\("sandbox", "allow-scripts"\)/, "size frames keep the scripts-only sandbox");
 	assert.ok(!/setAttribute\("style"|\.cssText/.test(sizes), "styles go through the CSSOM");
 	const store = read("canvas-store.js");
@@ -607,7 +607,7 @@ test("All sizes keeps the module rules: state through the store, board fields do
 test("index.html has the All sizes icon, and canvas.css styles the frames, the chip and the comment's size in the Sizes section on --gd-* tokens", () => {
 	const html = read("index.html");
 	assert.match(html, /<symbol id="i-devices" viewBox="0 0 24 24">/);
-	assert.ok(!/data-i18n/.test(html));
+	assert.ok(!/data-i18n/.test(html.slice(html.indexOf('<svg id="gd-sprite"'), html.indexOf("</svg>"))));
 	const css = read("canvas.css");
 	const start = css.indexOf("/* Screen sizes (canvas-sizes.js)");
 	assert.ok(start >= 0 && css.split("/* Screen sizes (canvas-sizes.js)").length === 2, "one Sizes section");
