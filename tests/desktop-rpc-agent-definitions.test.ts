@@ -127,24 +127,21 @@ test("list_agent_definitions answers the discovered agents, subagent defaults, a
 	assert.equal(raw.includes("extreme"), false, "no problem text crosses");
 });
 
-test("list_agent_definitions covers the /gentle:profiles roots: built-in package agents, ~/.agents, and <cwd>/.agents, each with its source", async (t) => {
+test("list_agent_definitions offers only the agent directories the launch resolves, not the wider profile set", async (t) => {
 	const f = fixture(t);
 	const builtinDir = join(f.root, "package", "agents");
-	for (const dir of [builtinDir, join(f.root, ".agents"), join(f.cwd, ".agents")]) mkdirSync(dir, { recursive: true });
-	writeFileSync(join(builtinDir, "jd-judge-a.md"), "---\nname: jd-judge-a\ndescription: Built-in judge A.\n---\nbody");
+	for (const dir of [builtinDir, join(f.root, ".agents"), join(f.cwd, ".agents"), join(f.cwd, ".pi", "agents")]) mkdirSync(dir, { recursive: true });
 	writeFileSync(join(builtinDir, "planner.md"), "---\nname: planner\ndescription: Built-in planner.\n---\nbody");
-	writeFileSync(join(f.root, ".agents", "planner.md"), "---\nname: planner\ndescription: User planner.\n---\nbody");
 	writeFileSync(join(f.root, ".agents", "helper.md"), "---\nname: helper\ndescription: User helper.\n---\nbody");
-	writeFileSync(join(f.cwd, ".agents", "helper.md"), "---\nname: helper\ndescription: Project helper.\n---\nbody");
 	writeFileSync(join(f.cwd, ".agents", "local.md"), "---\nname: local\ndescription: Project local.\n---\nbody");
-	const app = harness(t, () => ({ ...locate(f)({} as never), builtinDirs: [builtinDir] }));
-	await app.invoke("roots-1", {});
+	writeFileSync(join(f.cwd, ".pi", "agents", "ghost.md"), "---\nname: ghost\ndescription: Project ghost.\n---\nbody");
+	writeFileSync(join(f.agentHome, "agents", "worker.md"), "---\nname: worker\ndescription: Agent home worker.\n---\nbody");
+	const app = harness(t, locate(f));
+	await app.invoke("roots-2", {});
 	const agents = app.last().data.agents.map((agent: { name: string; description: string; scope: string; source: string }) => ({ name: agent.name, description: agent.description, scope: agent.scope, source: agent.source }));
 	assert.deepEqual(agents, [
-		{ name: "helper", description: "Project helper.", scope: "project", source: "project" },
-		{ name: "jd-judge-a", description: "Built-in judge A.", scope: "global", source: "builtin" },
-		{ name: "local", description: "Project local.", scope: "project", source: "project" },
-		{ name: "planner", description: "User planner.", scope: "global", source: "user" },
+		{ name: "ghost", description: "Project ghost.", scope: "project", source: "project" },
+		{ name: "worker", description: "Agent home worker.", scope: "global", source: "user" },
 	]);
 });
 

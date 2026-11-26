@@ -88,8 +88,19 @@ async function runSyncWithRetry(
 	sleep: (ms: number) => Promise<void>,
 	sink?: (info: CodegraphCommandInfo) => void,
 ): Promise<boolean> {
-	const attempt = (): Promise<boolean> => run(["sync", "-q"], cwd, SYNC_TIMEOUT_MS, undefined, sink);
+	let lastInfo: { ok: boolean; teardownUnconfirmed?: boolean } | undefined;
+	const attempt = async (): Promise<boolean> => {
+		const ok = await run(["sync", "-q"], cwd, SYNC_TIMEOUT_MS, undefined, (info) => {
+			lastInfo = info;
+			sink?.(info);
+		});
+		return ok;
+	};
 	if (await attempt()) return true;
+	// An unconfirmed teardown means the timed-out writer may still be writing the index: a retry
+	// beside it is exactly the race this contract forbids, so the failure stands instead of backing
+	// off and hoping the writer is gone.
+	if (lastInfo?.teardownUnconfirmed) return false;
 	await sleep(SYNC_RETRY_DELAY_MS);
 	return attempt();
 }
@@ -662,7 +673,7 @@ const GROUP_GONE_CAP_MS = 2_000;
  * observes a CONFIRMED kill — `windowsKillDone`, wired by the caller from the kill helper's own
  * outcome — and is bounded by the same cap when that result cannot be confirmed,
  * so a caller never releases its index lease while members of the tree can still run. */
-function waitForKilledGroup(pgid: number | undefined, capMs: number, isSettled: () => boolean, onGone: () => void, windowsKillDone?: () => boolean): void {
+function waitForKilledGroup(pgid: number | undefined, capMs: number, isSettled: () => boolean, onGone: () => void, windowsKillDone?: () => boolean, onUnconfirmed: () => void = onGone): void {
 	if (pgid === undefined) {
 		onGone();
 		return;
@@ -685,11 +696,20 @@ function waitForKilledGroup(pgid: number | undefined, capMs: number, isSettled: 
 		let gone = false;
 		try {
 			process.kill(-pgid, 0);
-		} catch {
-			gone = true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") gone = true;
 		}
-		if (gone || Date.now() >= deadline) onGone();
-		else setTimeout(probe, GROUP_GONE_POLL_MS);
+		if (gone) {
+			onGone();
+			return;
+		}
+		if (Date.now() >= deadline) {
+			// The cap expired without proof that the group is gone: the teardown is unconfirmed, so
+			// the settlement reports that instead of relying on the Windows kill seam's default.
+			onUnconfirmed();
+			return;
+		}
+		setTimeout(probe, GROUP_GONE_POLL_MS);
 	};
 	probe();
 }
@@ -813,6 +833,15 @@ function runCodegraphCommand(args: readonly string[], cwd: string, timeoutMs: nu
 			}
 			finish(false);
 		};
+		// A POSIX settlement whose group kill could not be proven runs unconfirmed: the deadline
+		// expired without ESRCH proof, so the writer may still be alive and must not be retried.
+		const failTeardownUnconfirmed = (): void => {
+			teardownUnconfirmed = true;
+			child?.stdout?.destroy();
+			child?.stderr?.destroy();
+			child?.unref();
+			finish(false);
+		};
 		// One group SIGKILL and the settlement that observes it: a kill the seam confirmed releases
 		// the settlement as soon as the group is empty, while an unconfirmed one (taskkill failed or
 		// stalled) waits the cap and settles through the teardown report above. A settlement that
@@ -821,7 +850,7 @@ function runCodegraphCommand(args: readonly string[], cwd: string, timeoutMs: nu
 			if (settled) return;
 			if (treeKillSeam().platform() === "win32") startWindowsKill();
 			else killProcessTree(child, true, "SIGKILL");
-			waitForKilledGroup(child?.pid, capMs, () => settled, failWithTeardown, () => windowsKillConfirmed);
+			waitForKilledGroup(child?.pid, capMs, () => settled, failWithTeardown, () => windowsKillConfirmed, () => failTeardownUnconfirmed);
 		};
 		const timer = setTimeout(() => {
 			// The deadline expired: whatever exit code follows, the run is failed.
@@ -849,7 +878,12 @@ function runCodegraphCommand(args: readonly string[], cwd: string, timeoutMs: nu
 			exitCode = code;
 			// A zero exit code counts only when the deadline did not expire first: a command that
 			// handles the timeout's SIGTERM and exits 0 was still interrupted by the timeout.
-			finish(!timedOut && code === 0);
+			// A run that timed out is settled by the bounded tree teardown, not by the direct child's
+			// close: `close` proves the direct child and its stdio closed, not that the killed group is
+			// gone, so settling here could release an index beside a writer the kill has not yet
+			// confirmed. Normal exits keep their immediate settlement.
+			if (timedOut) return;
+			finish(code === 0);
 		});
 	});
 }

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmodSync, closeSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -245,6 +245,23 @@ test("a stale per-path mutex is stolen by the same liveness rules and released a
 	assert.equal(existsSync(`${path}.mutex`), false, "the mutex is dropped after the critical section");
 });
 
+test("stale recovery keeps an unreadable mutex out of stale recovery", (t) => {
+	const dir = locksDir(t);
+	const path = join(dir, "token.json");
+	const holder = deadPid();
+	const now = Date.now();
+	writeToken(path, { kind: "sync", pid: holder, startedAt: now, expiresAt: now - 1, host: localHost() });
+	const mutex = `${path}.mutex`;
+	// An unreadable mutex (a directory blocks the read) whose mtime is already older than the
+	// mutex TTL: stale-looking on mtime alone, but the record cannot be read, so recovery must not
+	// judge it stale and reclaim the path.
+	mkdirSync(mutex);
+	utimesSync(mutex, new Date(now - 60_000), new Date(now - 60_000));
+	assert.equal(tryAcquireLease(path, "sync", 120_000, now, undefined, 60), undefined, "an unreadable mutex fails closed instead of being judged stale");
+	assert.equal((JSON.parse(readFileSync(path, "utf8")) as { pid: number }).pid, holder, "the stale token is left untouched");
+	rmSync(mutex, { recursive: true, force: true });
+});
+
 test("release is bound to its own acquisition: it never removes a newer owner's token", (t) => {
 	const dir = locksDir(t);
 	const path = join(dir, "token.json");
@@ -399,6 +416,29 @@ test("a foreign machine's token, or a legacy boot-only token, stays unknown acro
 	writeToken(path, { kind: "init", pid: process.pid, startedAt: now - 120_000, expiresAt: now - 1, host: earlierBoot });
 	assert.equal(readLeaseVerdict(path, now), "unknown", "a legacy boot-only token keeps its unknown verdict");
 	assert.equal(tryAcquireLease(path, "init", 600_000, now), undefined);
+});
+
+test("boot recovery compares boot ids separately from pid namespaces: a same-boot token in another namespace is not judged as a reboot", (t) => {
+	const host = localHostIdentity();
+	const machine = localMachineIdentity();
+	if (host === null || machine === null) {
+		t.skip("this platform cannot derive machine or boot identity: the boot-vs-namespace judgement needs derivable identities");
+		return;
+	}
+	const dir = locksDir(t);
+	const path = join(dir, "token.json");
+	const now = Date.now();
+	const boot = host.startsWith("darwin:") ? host.slice("darwin:".length) : host.slice("linux:".length).split(":")[0];
+	if (!host.startsWith("linux:")) {
+		t.skip("a pid namespace is only derivable on linux: the same-boot-other-namespace shape needs one");
+		return;
+	}
+	// Same boot as this machine, but inside a different pid namespace: the token is NOT from an
+	// earlier boot, so reboot recovery must not fire — the normal provenance/TTL path judges it.
+	const tokenHost = `linux:${boot}:pid:[999999]`;
+	writeToken(path, { kind: "init", pid: process.pid, startedAt: now - 120_000, expiresAt: now - 1, host: tokenHost, machine });
+	assert.equal(readLeaseVerdict(path, now), "unknown", "a same-boot token in another pid namespace is not judged as a reboot");
+	assert.equal(tryAcquireLease(path, "init", 600_000, now), undefined, "never reclaimed as a reboot-recovery stale token");
 });
 
 test("a local holder's stale token is still judged by pid and TTL once host identity matches", (t) => {

@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { linkSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, fstatSync, linkSync, mkdirSync, openSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { canonicalRoot } from "./codegraph-canonical.ts";
@@ -126,6 +126,21 @@ function deriveMachineIdentity(): string | null {
 }
 
 /**
+ * The boot-scoped portion of a host identity: `darwin:<boot>` or `linux:<boot>:<pid-namespace>`.
+ * Comparing boot IDs separately from the PID namespace lets the reboot check judge a reboot
+ * without conflating a namespace change with a boot change.
+ */
+function hostBootScope(host: string | null | undefined): string | null {
+	if (!host) return null;
+	const sep = host.indexOf(":");
+	if (sep < 0) return null;
+	const rest = host.slice(sep + 1);
+	const nextSep = rest.indexOf(":");
+	if (nextSep < 0) return rest;
+	return rest.slice(0, nextSep);
+}
+
+/**
  * Tri-state pid probe for host-less reclaims: ESRCH alone confirms death in this namespace,
  * EPERM confirms existence under another user, and any other failure proves nothing — the
  * caller keeps its fail-closed verdict instead of treating the lookup as proof of death.
@@ -205,9 +220,12 @@ export function readLeaseVerdict(path: string, now: number = Date.now(), cwd?: s
 	// is reclaimable stale (the wedge is bounded by the TTL); unexpired it stays fail-closed
 	// until its TTL bounds it; a different machine or a legacy token without the machine part
 	// keeps the unknown verdict exactly as before.
+	const tokenBoot = token.host !== undefined ? hostBootScope(token.host) : null;
+	const currentBoot = host !== null ? hostBootScope(host) : null;
 	if (
 		token.host !== undefined && token.machine !== undefined &&
-		token.machine === leaseMachineIdentity() && token.host !== host
+		token.machine === leaseMachineIdentity() && tokenBoot !== null && currentBoot !== null &&
+		tokenBoot !== currentBoot
 	) {
 		return token.expiresAt <= now ? "held-stale" : "unknown";
 	}
@@ -346,16 +364,37 @@ function mutexPathFor(path: string): string {
 	return `${path}.mutex`;
 }
 
-/** Parses the mutex holder's record; anything unreadable or malformed is undefined. */
-function parseMutex(mutex: string): MutexToken | undefined {
+/** How a mutex holder's record was read; the stale-recovery grace must not cover an unreadable one. */
+type MutexRead =
+	| { status: "held"; token: MutexToken }
+	| { status: "missing" }
+	| { status: "malformed" }
+	| { status: "unreadable" };
+
+function readMutexFromFd(fd: number): MutexRead {
 	try {
-		const parsed: unknown = JSON.parse(readFileSync(mutex, "utf8"));
-		if (typeof parsed !== "object" || parsed === null) return undefined;
+		const parsed: unknown = JSON.parse(readFileSync(fd, "utf8"));
+		if (typeof parsed !== "object" || parsed === null) return { status: "malformed" };
 		const token = parsed as MutexToken;
-		if (typeof token.pid !== "number" || typeof token.startedAt !== "number" || typeof token.expiresAt !== "number") return undefined;
-		return token;
-	} catch {
-		return undefined;
+		if (typeof token.pid !== "number" || typeof token.startedAt !== "number" || typeof token.expiresAt !== "number") return { status: "malformed" };
+		return { status: "held", token };
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		return code === "ENOENT" ? { status: "missing" } : { status: "unreadable" };
+	}
+}
+
+function readMutex(mutex: string): MutexRead {
+	try {
+		const fd = openSync(mutex, "r");
+		try {
+			return readMutexFromFd(fd);
+		} finally {
+			closeSync(fd);
+		}
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		return code === "ENOENT" ? { status: "missing" } : { status: "unreadable" };
 	}
 }
 
@@ -399,8 +438,14 @@ interface MutexIdentity {
 
 function mutexIdentity(file: string): MutexIdentity | undefined {
 	try {
-		const stat = statSync(file, { bigint: true });
-		return { dev: stat.dev, ino: stat.ino, mtimeNs: stat.mtimeNs, nonce: parseMutex(file)?.nonce };
+		const fd = openSync(file, "r");
+		try {
+			const stat = fstatSync(fd, { bigint: true });
+			const read = readMutexFromFd(fd);
+			return { dev: stat.dev, ino: stat.ino, mtimeNs: stat.mtimeNs, nonce: read.status === "held" ? read.token.nonce : undefined };
+		} finally {
+			closeSync(fd);
+		}
 	} catch {
 		return undefined;
 	}
@@ -457,7 +502,10 @@ function withPathMutex<T>(path: string, waitMs: number, section: (owns: () => bo
 		const now = Date.now();
 		const mine = tryTakeMutex(mutex, now);
 		if (mine !== false) {
-			const owns = (): boolean => parseMutex(mutex)?.nonce === mine;
+			const owns = (): boolean => {
+				const read = readMutex(mutex);
+				return read.status === "held" && read.token.nonce === mine;
+			};
 			try {
 				return section(owns);
 			} finally {
@@ -466,10 +514,13 @@ function withPathMutex<T>(path: string, waitMs: number, section: (owns: () => bo
 				if (owns()) rmSync(mutex, { force: true }); // best effort: a leftover is stolen by TTL rules
 			}
 		}
-		const holder = parseMutex(mutex);
-		const blocking =
-			(holder !== undefined && holder.expiresAt > now && processAlive(holder.pid)) ||
-			(holder === undefined && mutexFreshOnDisk(mutex, now));
+		const holder = readMutex(mutex);
+		// An unreadable mutex fails closed: its bytes cannot be judged stale, so the recovery must
+		// not reclaim the path on the strength of a timestamp it cannot read.
+		if (holder.status === "unreadable") return undefined;
+		const blocking = holder.status === "held"
+			? holder.token.expiresAt > now && processAlive(holder.token.pid)
+			: holder.status === "malformed" && mutexFreshOnDisk(mutex, now);
 		if (blocking) {
 			if (now >= deadline) return undefined;
 			sleepSync(MUTEX_POLL_MS);

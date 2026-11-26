@@ -362,6 +362,28 @@ test("prepareReadiness: a live daemon syncs without unlocking; a dead one runs t
 	assert.deepEqual(deadCalls, ["run:sync -q"], "no live daemon: the lease holder refreshes with the sync alone");
 });
 
+test("prepareReadiness: a live daemon sync that fails with an unconfirmed teardown is not retried", async (t) => {
+	const cwd = dir(t, "sync-unconfirmed-retry");
+	writeDb(cwd);
+	const registry = dir(t, "sync-unconfirmed-registry");
+	const socket = join(registry, "live.sock");
+	writeFileSync(socket, "");
+	fakeRegistryRecord(registry, cwd, socket, process.pid);
+	const calls: string[] = [];
+	const result = await prepareReadiness(fakeInput(cwd, {
+		registryDir: registry,
+		run: async (args, _runCwd, _timeoutMs, _onSpawn, onInfo) => {
+			calls.push(`run:${args.join(" ")}`);
+			onInfo?.({ ok: false, teardownUnconfirmed: true });
+			return false;
+		},
+		warm: async () => true,
+		sleep: async () => {},
+	}));
+	assert.deepEqual(result, { action: "sync", ok: false, warm: "ok" });
+	assert.deepEqual(calls, ["run:sync -q"], "a failed sync with an unconfirmed teardown is not retried beside the writer");
+});
+
 test("prepareReadiness: a failed daemon-less sync still warms; a failed init does not", async (t) => {
 	const synced = dir(t, "sync-fail");
 	writeDb(synced);
@@ -770,6 +792,36 @@ test("runCodegraph: a command that exits zero after handling the timeout's SIGTE
 	});
 	assert.equal(ok, false, "the deadline expired: the run reports the timeout, not the later exit code");
 	assert.deepEqual(events, [{ ok: false, exitCode: 0 }], "the command exited zero after SIGTERM and the result still records the timeout failure");
+});
+
+test("runCodegraph: a timed-out run settles through the teardown path, not the child close event", { timeout: 60_000 }, async (t) => {
+	if (process.platform === "win32") return t.skip("POSIX fake-bin harness; the Windows settlement path itself runs through the kill seam");
+	const bin = dir(t, "winkill-timeout-close-bin");
+	const pidFile = join(bin, "child.pid");
+	// The command exits just after the deadline, so its close event lands while the run is already
+	// timed out and the kill is still in flight (withheld here on purpose).
+	writeFileSync(join(bin, "codegraph"), "#!/bin/sh\nsleep 0.35\nexit 0\n");
+	chmodSync(join(bin, "codegraph"), 0o755);
+	const previousPath = process.env.PATH;
+	process.env.PATH = `${bin}:${previousPath}`;
+	process.env.FAKE_PIDFILE = pidFile;
+	t.after(() => {
+		process.env.PATH = previousPath;
+		delete process.env.FAKE_PIDFILE;
+	});
+	setTreeKillSeamForTests({
+		platform: () => "win32",
+		// A taskkill whose result never arrives: the run can never confirm the tree gone, so a
+		// settlement that waits for teardown must report it as unconfirmed.
+		windowsKill: () => {},
+	});
+	t.after(() => setTreeKillSeamForTests(undefined));
+	const infos: Array<{ ok: boolean; exitCode?: number | null; teardownUnconfirmed?: boolean }> = [];
+	const ok = await runCodegraph(["sync", "-q"], dir(t, "winkill-timeout-close-cwd"), 200, undefined, (info) => {
+		infos.push(info);
+	});
+	assert.equal(ok, false, "the timed-out command still reports the failure");
+	assert.equal(infos[infos.length - 1]?.teardownUnconfirmed, true, "a timed-out run whose kill never confirmed settles unconfirmed through the teardown path");
 });
 
 test("runCodegraph: a throwing onInfo sink never swallows the command result", { timeout: 5_000 }, async (t) => {

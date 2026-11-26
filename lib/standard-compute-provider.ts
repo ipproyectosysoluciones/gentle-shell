@@ -65,30 +65,35 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-// Conservative defaults for models listed by the gateway but absent from the fallback catalog.
-function unmanagedChatModel(id: string): StandardComputeChatModelConfig {
-	return {
-		id,
-		name: id,
-		input: ["text", "image"],
-		contextWindow: 1_000_000,
-		reasoning: true,
-		maxTokens: 1_000_000,
-		api: "openai-completions",
-		cost: ZERO_COST,
-	} as StandardComputeChatModelConfig;
+// Live model rows keep the capabilities and context limit validated by the gateway.
+export interface StandardComputeModelRow {
+	id: string;
+	contextLength?: number;
+	inputModalities?: string[];
+	reasoning?: boolean;
+	supportedParameters?: string[];
 }
 
-function buildCatalog(ids: readonly string[]): StandardComputeChatModelConfig[] {
+function buildCatalog(rows: readonly StandardComputeModelRow[]): StandardComputeChatModelConfig[] {
 	const models = new Map<string, StandardComputeChatModelConfig>();
-	for (const rawId of ids) {
-		const id = rawId.trim();
+	for (const row of rows) {
+		const id = row.id.trim();
 		if (!id) continue;
 		if (id.toLowerCase() === SMART_ROUTING_MODEL_ID) {
 			models.set(SMART_ROUTING_MODEL_ID, cloneModel(SMART_ROUTING_MODEL));
 			continue;
 		}
-		models.set(id, unmanagedChatModel(id));
+		const contextLength = typeof row.contextLength === "number" && row.contextLength > 0 ? row.contextLength : 1_000_000;
+		models.set(id, {
+			id,
+			name: id,
+			input: row.inputModalities && row.inputModalities.length > 0 ? row.inputModalities : ["text", "image"],
+			contextWindow: contextLength,
+			reasoning: row.reasoning ?? true,
+			maxTokens: contextLength,
+			api: "openai-completions",
+			cost: ZERO_COST,
+		} as StandardComputeChatModelConfig);
 	}
 	return [...models.values()];
 }
@@ -99,7 +104,7 @@ async function fetchLiveModelIds(options: {
 	signal: AbortSignal;
 	fetchImpl: typeof fetch;
 	timeoutMs: number;
-}): Promise<string[] | undefined> {
+}): Promise<StandardComputeModelRow[] | undefined> {
 	const { apiKey, signal, fetchImpl, timeoutMs } = options;
 	if (signal.aborted) return undefined;
 
@@ -125,13 +130,21 @@ async function fetchLiveModelIds(options: {
 		if (!isRecord(payload) || !Array.isArray(payload.data)) return undefined;
 		if (payload.data.length === 0) return [];
 
-		const ids = new Set<string>();
+		const rows: StandardComputeModelRow[] = [];
 		for (const row of payload.data) {
 			if (!isRecord(row) || typeof row.id !== "string") continue;
 			const id = row.id.trim();
-			if (id) ids.add(id);
+			if (!id) continue;
+			const architecture = isRecord(row.architecture) ? row.architecture : undefined;
+			rows.push({
+				id,
+			contextLength: typeof row.context_length === "number" ? row.context_length : undefined,
+				inputModalities: Array.isArray(architecture?.input_modalities) ? architecture.input_modalities.filter((m): m is string => typeof m === "string") : undefined,
+				reasoning: typeof row.reasoning === "boolean" ? row.reasoning : undefined,
+				supportedParameters: Array.isArray(row.supported_parameters) ? row.supported_parameters.filter((p): p is string => typeof p === "string") : undefined,
+			});
 		}
-		return ids.size > 0 ? [...ids] : undefined;
+		return rows.length > 0 ? rows : undefined;
 	} catch {
 		// Discovery is best-effort. Never log request or response data: it may contain credentials.
 		return undefined;
@@ -153,10 +166,12 @@ function createCatalogConfig(options: StandardComputeProviderOptions = {}): {
 	return {
 		getModels: () => cloneCatalog(catalog),
 		refreshModels: async (context: RefreshModelsContext) => {
-			const apiKey = context.credential?.type === "api_key" ? context.credential.key : undefined;
-			if (apiKey !== catalogKey) {
+			const storedKey = context.credential?.type === "api_key" ? context.credential.key?.trim() : undefined;
+			// Effective authentication: an explicit stored key wins, otherwise the provider env key applies.
+			const effectiveKey = storedKey || (process.env.STANDARDCOMPUTE_API_KEY ?? "").trim() || undefined;
+			if (effectiveKey !== catalogKey) {
 				// A live catalog is authoritative only for the credential that discovered it.
-				catalogKey = apiKey;
+				catalogKey = effectiveKey;
 				credentialRevision++;
 				catalog = cloneCatalog([SMART_ROUTING_MODEL]);
 			}
@@ -165,18 +180,19 @@ function createCatalogConfig(options: StandardComputeProviderOptions = {}): {
 				return;
 			}
 
-			const ids = await fetchLiveModelIds({
-				apiKey,
+			const rows = await fetchLiveModelIds({
+				apiKey: effectiveKey,
 				signal: context.signal,
 				fetchImpl,
 				timeoutMs: options.timeoutMs ?? STANDARDCOMPUTE_MODELS_TIMEOUT_MS,
 			});
-			if (revision !== credentialRevision || ids === undefined || context.signal.aborted) {
+			if (revision !== credentialRevision || rows === undefined || context.signal.aborted) {
+				// Preserve the discovered catalog when the credential identity is unchanged and the refresh failed.
 				return;
 			}
 
 			await context.publish({ update: () => {
-				if (revision === credentialRevision && !context.signal.aborted) catalog = buildCatalog(ids);
+				if (revision === credentialRevision && !context.signal.aborted) catalog = buildCatalog(rows);
 			} });
 		},
 	};
